@@ -5,6 +5,7 @@ import torch
 from telestyle_spherical import (
     SphericalLatentProjector,
     early_polar_guidance_strength,
+    latitude_adaptive_circular_lowpass,
     make_circular_latent_canvas,
     make_rotated_latent_canvas,
 )
@@ -54,6 +55,26 @@ class SphericalReprojectionTests(unittest.TestCase):
         fused = projector.fuse_a_with_b(a, b, strength=0.7)
         self.assertAlmostEqual(fused[0, 0, 0, 0].item(), 0.7, places=5)
         self.assertEqual(fused[0, 0, 8, 0].item(), 0.0)
+
+    def test_latitude_adaptive_lowpass_preserves_equator_and_blurs_poles(self):
+        source = torch.zeros(1, 1, 5, 16)
+        source[0, 0, 0, 0] = 1.0
+        source[0, 0, 2, 3] = 1.0
+        weight = torch.zeros(1, 1, 5, 16)
+        weight[:, :, 0] = 1.0
+        filtered = latitude_adaptive_circular_lowpass(source, weight, max_radius=4)
+        self.assertTrue(torch.equal(filtered[:, :, 2], source[:, :, 2]))
+        self.assertLess(filtered[0, 0, 0, 0].item(), 1.0)
+        self.assertGreater(filtered[0, 0, 0, -1].item(), 0.0)
+
+    def test_latitude_adaptive_lowpass_handles_zero_and_narrow_width(self):
+        source = torch.randn(1, 2, 4, 3)
+        weight = torch.ones(1, 1, 4, 3)
+        self.assertTrue(torch.equal(latitude_adaptive_circular_lowpass(source, weight, 0), source))
+        filtered = latitude_adaptive_circular_lowpass(source, weight, 8)
+        self.assertEqual(filtered.shape, source.shape)
+        with self.assertRaises(ValueError):
+            latitude_adaptive_circular_lowpass(source, weight, -1)
 
     def test_early_guidance_schedule_uses_only_initial_steps(self):
         strengths = [early_polar_guidance_strength(step, 2) for step in range(4)]

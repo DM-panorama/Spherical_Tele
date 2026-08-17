@@ -86,6 +86,36 @@ def make_circular_latent_canvas(
     )
 
 
+def latitude_adaptive_circular_lowpass(
+    source: torch.Tensor,
+    polar_weight: torch.Tensor,
+    max_radius: int,
+) -> torch.Tensor:
+    """Circularly low-pass ERP longitude with strength increasing toward poles."""
+    if source.ndim != 4:
+        raise ValueError("source must have shape [batch, channels, height, width].")
+    if max_radius < 0:
+        raise ValueError("max_radius cannot be negative.")
+    if polar_weight.ndim != 4 or polar_weight.shape[-2:] != source.shape[-2:]:
+        raise ValueError("polar_weight must match source height and width.")
+    if polar_weight.shape[0] not in (1, source.shape[0]) or polar_weight.shape[1] not in (1, source.shape[1]):
+        raise ValueError("polar_weight batch and channel dimensions must broadcast to source.")
+    radius = min(max_radius, max(0, (source.shape[-1] - 1) // 2))
+    if radius == 0:
+        return source
+
+    working = source.float()
+    offsets = torch.arange(-radius, radius + 1, device=source.device, dtype=torch.float32)
+    sigma = max(radius / 2.0, 0.5)
+    kernel = torch.exp(-0.5 * (offsets / sigma) ** 2)
+    kernel = (kernel / kernel.sum()).view(1, 1, 1, -1)
+    kernel = kernel.expand(source.shape[1], 1, 1, -1)
+    padded = F.pad(working, (radius, radius, 0, 0), mode="circular")
+    blurred = F.conv2d(padded, kernel, groups=source.shape[1])
+    weight = polar_weight.to(device=source.device, dtype=working.dtype)
+    return (working * (1.0 - weight) + blurred * weight).to(dtype=source.dtype)
+
+
 def early_polar_guidance_strength(
     progress_id: int,
     guidance_steps: int,

@@ -102,6 +102,7 @@ def stylize_panorama(
     polar_blend_end_degrees: float = 75.0,
     polar_fusion_steps: int = 2,
     polar_fusion_strength: float = 1.0,
+    polar_lowpass_radius_latent: int = 8,
 ) -> tuple[Image.Image, int, Tuple[int, int]]:
     """Run one wrapped inference pass and return the seam-blended ERP."""
     content = content.convert("RGB")
@@ -123,6 +124,8 @@ def stylize_panorama(
             raise ValueError("polar-fusion-strength must be between zero and one.")
         if not 0 <= polar_blend_start_degrees < polar_blend_end_degrees < 90:
             raise ValueError("polar blend degrees must satisfy 0 <= start < end < 90.")
+        if polar_lowpass_radius_latent < 0:
+            raise ValueError("polar-lowpass-radius-latent cannot be negative.")
 
     wrapped = make_wrapped_canvas(content, margin)
     working_content = resize_for_pipeline(wrapped)
@@ -144,6 +147,7 @@ def stylize_panorama(
             centre_x_latent, centre_width_latent, blend_width_latent,
             polar_rotation_degrees, polar_blend_start_degrees,
             polar_blend_end_degrees, polar_fusion_steps, polar_fusion_strength,
+            polar_lowpass_radius_latent,
         )
     else:
         generated = engine.inference_with_latent_seam_sync(
@@ -170,6 +174,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--polar-blend-end-degrees", type=float, default=75.0, help="Latitude where polar fusion reaches full weight")
     parser.add_argument("--polar-fusion-steps", type=int, default=2, help="Number of initial denoising steps guided by branch B")
     parser.add_argument("--polar-fusion-strength", type=float, default=1.0, help="Multiplier for the early B-to-A guidance schedule")
+    parser.add_argument("--polar-lowpass-radius-latent", type=int, default=8, help="Maximum polar circular low-pass radius in latent pixels; zero disables it")
     return parser.parse_args()
 
 
@@ -191,7 +196,7 @@ def main() -> None:
             args.margin_px, args.blend_px, args.enable_polar_fusion,
             args.polar_rotation_degrees, args.polar_blend_start_degrees,
             args.polar_blend_end_degrees, args.polar_fusion_steps,
-            args.polar_fusion_strength,
+            args.polar_fusion_strength, args.polar_lowpass_radius_latent,
         )
 
     output_path = Path(args.output)

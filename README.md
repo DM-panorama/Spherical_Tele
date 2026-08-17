@@ -91,9 +91,10 @@ python telestylepanorama_inference.py \
   --polar-rotation-degrees 90 \
   --polar-blend-start-degrees 45 \
   --polar-blend-end-degrees 75 \
-  --polar-fusion-steps 2
+  --polar-fusion-steps 2 \
+  --polar-lowpass-radius-latent 8
 ```
-输出保持输入全景图分辨率。双分支模式默认以 `0.35`、`0.20` 的系数引导最初两步；`--polar-fusion-strength` 为该调度的倍率。其余参数可通过 `--help` 查看。
+输出保持输入全景图分辨率。双分支模式默认以 `0.35`、`0.20` 的系数引导最初两步；旋回后的 B 预测会在高纬做经度环形低通，`--polar-lowpass-radius-latent` 默认 `8`，设为 `0` 可关闭。`--polar-fusion-strength` 为引导调度的倍率。其余参数可通过 `--help` 查看。
 
 #### Video Stylization
 ```

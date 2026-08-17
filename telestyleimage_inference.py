@@ -8,6 +8,7 @@ from tqdm import tqdm
 from telestyle_spherical import (
     SphericalLatentProjector,
     early_polar_guidance_strength,
+    latitude_adaptive_circular_lowpass,
     make_circular_latent_canvas,
     make_rotated_latent_canvas,
 )
@@ -204,6 +205,7 @@ class ImageStyleInference:
         polar_blend_end_degrees=75.0,
         polar_fusion_steps=2,
         polar_fusion_strength=1.0,
+        polar_lowpass_radius_latent=8,
     ):
         """Use early B predictions to guide A's polar geometry, then refine A alone."""
         if content_a.size != content_b.size:
@@ -214,6 +216,8 @@ class ImageStyleInference:
             raise ValueError("polar_fusion_steps must be greater than zero.")
         if not 0.0 <= polar_fusion_strength <= 1.0:
             raise ValueError("polar_fusion_strength must be between zero and one.")
+        if polar_lowpass_radius_latent < 0:
+            raise ValueError("polar_lowpass_radius_latent cannot be negative.")
 
         pipe = self.pipe
         height, width = content_a.height, content_a.width
@@ -278,6 +282,9 @@ class ImageStyleInference:
                     ..., centre_x_latent : centre_x_latent + centre_width_latent
                 ]
                 b_aligned = projector.b_to_a(b_centre)
+                b_aligned = latitude_adaptive_circular_lowpass(
+                    b_aligned, projector.polar_weight, polar_lowpass_radius_latent
+                )
                 b_canvas = make_circular_latent_canvas(
                     b_aligned, centre_x_latent, right_extension_width
                 )
