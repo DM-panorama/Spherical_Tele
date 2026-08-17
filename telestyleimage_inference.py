@@ -2,6 +2,36 @@ import torch
 import os
 import glob
 from PIL import Image
+from tqdm import tqdm
+
+
+def synchronize_wrapped_latents(latents, centre_x, centre_width, blend_width):
+    """Synchronize duplicate ERP edge strips in-place in VAE latent space."""
+    if blend_width == 0:
+        return latents
+    if latents.ndim != 4:
+        raise ValueError("latents must have shape [batch, channels, height, width].")
+    if (
+        centre_x < blend_width
+        or centre_width < 2 * blend_width
+        or centre_x + centre_width + blend_width > latents.shape[-1]
+    ):
+        raise ValueError("The requested seam strips do not fit inside the latent canvas.")
+    left_main = latents[..., centre_x : centre_x + blend_width].clone()
+    right_extension = latents[..., centre_x + centre_width : centre_x + centre_width + blend_width].clone()
+    alpha_left = torch.linspace(0.0, 1.0, blend_width, device=latents.device, dtype=latents.dtype).view(1, 1, 1, -1)
+    left_merged = right_extension * (1.0 - alpha_left) + left_main * alpha_left
+    latents[..., centre_x : centre_x + blend_width] = left_merged
+    latents[..., centre_x + centre_width : centre_x + centre_width + blend_width] = left_merged
+    right_main_start = centre_x + centre_width - blend_width
+    right_main = latents[..., right_main_start : right_main_start + blend_width].clone()
+    left_extension = latents[..., centre_x - blend_width : centre_x].clone()
+    alpha_right = torch.linspace(1.0, 0.0, blend_width, device=latents.device, dtype=latents.dtype).view(1, 1, 1, -1)
+    right_merged = right_main * alpha_right + left_extension * (1.0 - alpha_right)
+    latents[..., right_main_start : right_main_start + blend_width] = right_merged
+    latents[..., centre_x - blend_width : centre_x] = right_merged
+    return latents
+
 from diffsynth.pipelines.qwen_image import QwenImagePipeline, ModelConfig
 
 
@@ -101,7 +131,29 @@ class ImageStyleInference:
         return image
 
 
-
+    @torch.no_grad()
+    def inference_with_latent_seam_sync(self, prompt, content, style, seed, num_inference_steps, centre_x_latent, centre_width_latent, blend_width_latent):
+        """Run Qwen-Image-Edit while synchronizing duplicate ERP latents."""
+        pipe = self.pipe
+        height, width = content.height, content.width
+        pipe.scheduler.set_timesteps(num_inference_steps, denoising_strength=1.0, dynamic_shift_len=(height // 16) * (width // 16))
+        inputs_posi, inputs_nega = {"prompt": prompt}, {"negative_prompt": ""}
+        inputs_shared = {"cfg_scale": 1.0, "input_image": None, "denoising_strength": 1.0, "inpaint_mask": None, "inpaint_blur_size": None, "inpaint_blur_sigma": None, "height": height, "width": width, "seed": seed, "rand_device": "cpu", "num_inference_steps": num_inference_steps, "blockwise_controlnet_inputs": None, "tiled": False, "tile_size": 128, "tile_stride": 64, "eligen_entity_prompts": None, "eligen_entity_masks": None, "eligen_enable_on_negative": False, "edit_image": [content, style], "edit_image_auto_resize": False, "edit_rope_interpolation": False, "context_image": None, "zero_cond_t": False}
+        for unit in pipe.units:
+            inputs_shared, inputs_posi, inputs_nega = pipe.unit_runner(unit, pipe, inputs_shared, inputs_posi, inputs_nega)
+        synchronize_wrapped_latents(inputs_shared["latents"], centre_x_latent, centre_width_latent, blend_width_latent)
+        pipe.load_models_to_device(pipe.in_iteration_models)
+        models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
+        for progress_id, timestep in enumerate(tqdm(pipe.scheduler.timesteps)):
+            timestep = timestep.unsqueeze(0).to(dtype=pipe.torch_dtype, device=pipe.device)
+            noise_pred = pipe.cfg_guided_model_fn(pipe.model_fn, 1.0, inputs_shared, inputs_posi, inputs_nega, **models, timestep=timestep, progress_id=progress_id)
+            inputs_shared["latents"] = pipe.step(pipe.scheduler, progress_id=progress_id, noise_pred=noise_pred, **inputs_shared)
+            synchronize_wrapped_latents(inputs_shared["latents"], centre_x_latent, centre_width_latent, blend_width_latent)
+        pipe.load_models_to_device(["vae"])
+        image = pipe.vae.decode(inputs_shared["latents"], device=pipe.device, tiled=False)
+        image = pipe.vae_output_to_image(image)
+        pipe.load_models_to_device([])
+        return image
 
 if __name__ == "__main__":
     inference_engine = ImageStyleInference()

@@ -68,6 +68,22 @@ We provide inference scripts for running TeleStyle-Image and TeleStyle-Video:
 python telestyleimage_inference.py
 ```
 
+#### Seam-aware Panorama Stylization
+For equirectangular panoramas, use the dedicated script. It circularly extends
+the left/right image edges before stylization, synchronizes duplicate edge
+latents at every denoising step, then crops the centre panorama without RGB-space
+feathering.
+```
+python telestylepanorama_inference.py \
+  --content inputs/panorama.png \
+  --style inputs/style.jpg \
+  --output qwen_style_output/panorama_result.png \
+  --margin-px 256 \
+  --blend-px 96
+```
+The output retains the input panorama resolution. Use `--help` for prompt,
+seed, and inference-step options.
+
 #### Video Stylization
 ```
 python telestylevideo_inference.py --video_path assets/example/1.mp4 --image_path assets/example/1-0.png --output_path results
@@ -87,4 +103,3 @@ If you find TeleStyle useful in your research, please light a star for the proje
     journal={arXiv preprint arXiv:2601.20175},
     year={2026}
 }
-
