@@ -16,6 +16,7 @@ import torch
 from PIL import Image
 
 from telestyleimage_inference import ImageStyleInference
+from telestyle_spherical import rotate_erp_image
 
 
 DEFAULT_PROMPT = (
@@ -95,6 +96,12 @@ def stylize_panorama(
     steps: int,
     margin_px: int,
     blend_px: int,
+    enable_polar_fusion: bool = False,
+    polar_rotation_degrees: float = 90.0,
+    polar_blend_start_degrees: float = 45.0,
+    polar_blend_end_degrees: float = 75.0,
+    polar_fusion_steps: int = 2,
+    polar_fusion_strength: float = 1.0,
 ) -> tuple[Image.Image, int, Tuple[int, int]]:
     """Run one wrapped inference pass and return the seam-blended ERP."""
     content = content.convert("RGB")
@@ -109,16 +116,40 @@ def stylize_panorama(
         raise ValueError("blend-px cannot be negative.")
     if blend_px > margin:
         raise ValueError("blend-px cannot be larger than the effective margin.")
+    if enable_polar_fusion:
+        if polar_fusion_steps <= 0:
+            raise ValueError("polar-fusion-steps must be greater than zero.")
+        if not 0.0 <= polar_fusion_strength <= 1.0:
+            raise ValueError("polar-fusion-strength must be between zero and one.")
+        if not 0 <= polar_blend_start_degrees < polar_blend_end_degrees < 90:
+            raise ValueError("polar blend degrees must satisfy 0 <= start < end < 90.")
 
     wrapped = make_wrapped_canvas(content, margin)
     working_content = resize_for_pipeline(wrapped)
+    working_content_b = None
+    if enable_polar_fusion:
+        rotated_content = rotate_erp_image(content, polar_rotation_degrees)
+        working_content_b = resize_for_pipeline(make_wrapped_canvas(rotated_content, margin))
+        if working_content_b.size != working_content.size:
+            raise ValueError("Rotated and original working canvases must have identical dimensions.")
     working_style = style.convert("RGB").resize((1024, 1024), Image.Resampling.LANCZOS)
     x0 = round(margin * working_content.width / wrapped.width)
     x1 = round((margin + source_size[0]) * working_content.width / wrapped.width)
     centre_x_latent = x0 // 8
     centre_width_latent = x1 // 8 - centre_x_latent
     blend_width_latent = min(round(blend_px * working_content.width / wrapped.width / 8), centre_x_latent, centre_width_latent // 2)
-    generated = engine.inference_with_latent_seam_sync(prompt, working_content, working_style, seed, steps, centre_x_latent, centre_width_latent, blend_width_latent)
+    if enable_polar_fusion:
+        generated = engine.inference_with_latent_polar_fusion(
+            prompt, working_content, working_content_b, working_style, seed, steps,
+            centre_x_latent, centre_width_latent, blend_width_latent,
+            polar_rotation_degrees, polar_blend_start_degrees,
+            polar_blend_end_degrees, polar_fusion_steps, polar_fusion_strength,
+        )
+    else:
+        generated = engine.inference_with_latent_seam_sync(
+            prompt, working_content, working_style, seed, steps,
+            centre_x_latent, centre_width_latent, blend_width_latent,
+        )
     result = extract_panorama(generated, source_size, margin)
     return result, margin, working_content.size
 
@@ -133,6 +164,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--margin-px", type=int, default=256, help="Circular extension width")
     parser.add_argument("--blend-px", type=int, default=96, help="Latent seam synchronization width")
+    parser.add_argument("--enable-polar-fusion", action="store_true", help="Enable rotated dual-branch polar prediction fusion")
+    parser.add_argument("--polar-rotation-degrees", type=float, default=90.0, help="Fixed X-axis ERP rotation for branch B")
+    parser.add_argument("--polar-blend-start-degrees", type=float, default=45.0, help="Latitude where polar fusion begins")
+    parser.add_argument("--polar-blend-end-degrees", type=float, default=75.0, help="Latitude where polar fusion reaches full weight")
+    parser.add_argument("--polar-fusion-steps", type=int, default=2, help="Number of initial denoising steps guided by branch B")
+    parser.add_argument("--polar-fusion-strength", type=float, default=1.0, help="Multiplier for the early B-to-A guidance schedule")
     return parser.parse_args()
 
 
@@ -151,7 +188,10 @@ def main() -> None:
     with torch.no_grad():
         result, margin, working_size = stylize_panorama(
             engine, content, style, args.prompt, args.seed, args.steps,
-            args.margin_px, args.blend_px,
+            args.margin_px, args.blend_px, args.enable_polar_fusion,
+            args.polar_rotation_degrees, args.polar_blend_start_degrees,
+            args.polar_blend_end_degrees, args.polar_fusion_steps,
+            args.polar_fusion_strength,
         )
 
     output_path = Path(args.output)
@@ -159,7 +199,8 @@ def main() -> None:
     result.save(output_path)
     print(
         f"Saved {output_path} | input={content.size} | "
-        f"model_canvas={working_size} | margin={margin}px | blend={args.blend_px}px"
+        f"model_canvas={working_size} | margin={margin}px | blend={args.blend_px}px | "
+        f"polar_fusion={args.enable_polar_fusion}"
     )
 
 

@@ -69,10 +69,11 @@ python telestyleimage_inference.py
 ```
 
 #### Seam-aware Panorama Stylization
-For equirectangular panoramas, use the dedicated script. It circularly extends
-the left/right image edges before stylization, synchronizes duplicate edge
-latents at every denoising step, then crops the centre panorama without RGB-space
-feathering.
+对等距柱状全景图（ERP），请使用专用脚本。默认单分支模式会在生成前环形扩展左右边缘，
+并在每个去噪步骤同步重复的边缘 latent，最后裁取中心全景图，不进行 RGB 空间羽化。
+
+如需改善南北极附近的畸变，可启用双分支极区融合：脚本会额外生成绕 X 轴球面旋转后的 ERP，
+在最初若干步将其去噪预测旋回原坐标系并仅引导高纬区域，后续步骤仅由原始视角细化。该模式约增加一倍去噪时间。
 ```
 python telestylepanorama_inference.py \
   --content inputs/panorama.png \
@@ -80,9 +81,19 @@ python telestylepanorama_inference.py \
   --output qwen_style_output/panorama_result.png \
   --margin-px 256 \
   --blend-px 96
+
+# 可选：启用双分支极区融合（默认关闭）
+python telestylepanorama_inference.py \
+  --content inputs/panorama.png \
+  --style inputs/style.jpg \
+  --output qwen_style_output/panorama_polar_result.png \
+  --enable-polar-fusion \
+  --polar-rotation-degrees 90 \
+  --polar-blend-start-degrees 45 \
+  --polar-blend-end-degrees 75 \
+  --polar-fusion-steps 2
 ```
-The output retains the input panorama resolution. Use `--help` for prompt,
-seed, and inference-step options.
+输出保持输入全景图分辨率。双分支模式默认以 `0.35`、`0.20` 的系数引导最初两步；`--polar-fusion-strength` 为该调度的倍率。其余参数可通过 `--help` 查看。
 
 #### Video Stylization
 ```
