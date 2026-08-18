@@ -16,7 +16,11 @@ import torch
 from PIL import Image
 
 from telestyleimage_inference import ImageStyleInference
-from telestyle_spherical import rotate_erp_image
+from telestyle_spherical import (
+    extract_polar_stereographic_patch,
+    fuse_polar_stereographic_patch,
+    rotate_erp_image,
+)
 
 
 DEFAULT_PROMPT = (
@@ -108,6 +112,10 @@ def stylize_panorama(
     polar_detail_end_degrees: float = 88.0,
     polar_detail_radius_latent: int = 24,
     polar_detail_steps: int = 2,
+    enable_polar_patches: bool = False,
+    polar_patch_size: int = 512,
+    polar_patch_cap_degrees: float = 60.0,
+    polar_patch_blend_start_degrees: float = 45.0,
 ) -> tuple[Image.Image, int, Tuple[int, int]]:
     """Run one wrapped inference pass and return the seam-blended ERP."""
     content = content.convert("RGB")
@@ -122,6 +130,13 @@ def stylize_panorama(
         raise ValueError("blend-px cannot be negative.")
     if blend_px > margin:
         raise ValueError("blend-px cannot be larger than the effective margin.")
+    if enable_polar_patches:
+        if enable_polar_fusion:
+            raise ValueError("polar patches cannot be combined with rotated polar fusion.")
+        if polar_patch_size <= 0 or polar_patch_size % 16:
+            raise ValueError("polar-patch-size must be positive and divisible by 16.")
+        if not 0 <= polar_patch_blend_start_degrees < polar_patch_cap_degrees < 90:
+            raise ValueError("polar patch degrees must satisfy 0 <= blend start < cap < 90.")
     if enable_polar_fusion:
         if polar_fusion_steps <= 0:
             raise ValueError("polar-fusion-steps must be greater than zero.")
@@ -152,6 +167,25 @@ def stylize_panorama(
     centre_x_latent = x0 // 8
     centre_width_latent = x1 // 8 - centre_x_latent
     blend_width_latent = min(round(blend_px * working_content.width / wrapped.width / 8), centre_x_latent, centre_width_latent // 2)
+    if enable_polar_patches:
+        generated = engine.inference_with_latent_seam_sync(
+            prompt, working_content, working_style, seed, steps,
+            centre_x_latent, centre_width_latent, blend_width_latent,
+        )
+        result = extract_panorama(generated, source_size, margin)
+        for north, patch_seed in ((True, seed), (False, seed + 1)):
+            content_patch = extract_polar_stereographic_patch(
+                content, polar_patch_size, polar_patch_cap_degrees, north
+            )
+            generated_patch = engine.inference_polar_patch(
+                prompt, content_patch, working_style, patch_seed, steps
+            )
+            result = fuse_polar_stereographic_patch(
+                result, generated_patch, polar_patch_cap_degrees,
+                polar_patch_blend_start_degrees, north,
+            )
+        return result, margin, working_content.size
+
     if enable_polar_fusion:
         generated = engine.inference_with_latent_polar_fusion(
             prompt, working_content, working_content_b, working_style, seed, steps,
@@ -167,8 +201,7 @@ def stylize_panorama(
             prompt, working_content, working_style, seed, steps,
             centre_x_latent, centre_width_latent, blend_width_latent,
         )
-    result = extract_panorama(generated, source_size, margin)
-    return result, margin, working_content.size
+    return extract_panorama(generated, source_size, margin), margin, working_content.size
 
 
 def parse_args() -> argparse.Namespace:
@@ -193,6 +226,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--polar-detail-end-degrees", type=float, default=88.0, help="Latitude where final A detail limiting reaches full weight")
     parser.add_argument("--polar-detail-radius-latent", type=int, default=24, help="Maximum final A polar low-pass radius in latent pixels")
     parser.add_argument("--polar-detail-steps", type=int, default=2, help="Number of final A denoising steps to limit polar detail")
+    parser.add_argument("--enable-polar-patches", action="store_true", help="Generate stereographic north and south polar patches and blend them into the ERP")
+    parser.add_argument("--polar-patch-size", type=int, default=512, help="Square stereographic patch size; must be divisible by 16")
+    parser.add_argument("--polar-patch-cap-degrees", type=float, default=60.0, help="Angular radius covered by each polar patch")
+    parser.add_argument("--polar-patch-blend-start-degrees", type=float, default=45.0, help="Angular radius where polar patch blending begins")
     return parser.parse_args()
 
 
@@ -217,7 +254,8 @@ def main() -> None:
             args.polar_fusion_strength, args.polar_lowpass_radius_latent,
             args.polar_detail_limiter, args.polar_detail_start_degrees,
             args.polar_detail_end_degrees, args.polar_detail_radius_latent,
-            args.polar_detail_steps,
+            args.polar_detail_steps, args.enable_polar_patches, args.polar_patch_size,
+            args.polar_patch_cap_degrees, args.polar_patch_blend_start_degrees,
         )
 
     output_path = Path(args.output)

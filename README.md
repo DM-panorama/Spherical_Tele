@@ -98,7 +98,7 @@ python telestylepanorama_inference.py \
   --polar-detail-radius-latent 24 \
   --polar-detail-steps 2
 ```
-输出保持输入全景图分辨率。双分支模式默认以 `0.35`、`0.20` 的系数引导最初两步；旋回后的 B 预测会在高纬做经度环形低通，`--polar-lowpass-radius-latent` 默认 `8`，设为 `0` 可关闭。A 在最后两步默认以 `65°–88°` 的纬度权重限制过采样极区细节，可用 `--no-polar-detail-limiter` 关闭。`--polar-fusion-strength` 为引导调度的倍率。其余参数可通过 `--help` 查看。
+输出保持输入全景图分辨率。双分支模式默认以 `0.35`、`0.20` 的系数引导最初两步；旋回后的 B 预测会在高纬做经度环形低通，`--polar-lowpass-radius-latent` 默认 `8`，设为 `0` 可关闭。A 在最后两步默认以 `65°–88°` 的纬度权重限制过采样极区细节，可用 `--no-polar-detail-limiter` 关闭。`--polar-fusion-strength` 为引导调度的倍率。若极点仍有大尺度畸变，可加 `--enable-polar-patches`：该模式会分别完成主 ERP、北极 `512×512` 立体投影 patch、南极 `512×512` 立体投影 patch 三次完整去噪，再在 RGB 空间将北、南 patch 以 `45°–60°` 余弦过渡带反投影融合回主 ERP。该模式不能与 `--enable-polar-fusion` 同时使用。其余参数可通过 `--help` 查看。
 
 #### Video Stylization
 ```

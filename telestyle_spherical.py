@@ -57,8 +57,8 @@ def _sample_circular_erp(source: torch.Tensor, grid: torch.Tensor) -> torch.Tens
     """Bilinearly sample ``source`` with circular longitude handling."""
     if source.ndim != 4:
         raise ValueError("source must have shape [batch, channels, height, width].")
-    if grid.shape[:2] != source.shape[-2:] or grid.shape[-1] != 2:
-        raise ValueError("grid shape must be [height, width, 2] for source.")
+    if grid.ndim != 3 or grid.shape[-1] != 2:
+        raise ValueError("grid must have shape [output_height, output_width, 2].")
     padded = F.pad(source, (1, 1, 0, 0), mode="circular")
     return F.grid_sample(
         padded,
@@ -166,6 +166,65 @@ def latitude_adaptive_circular_lowpass(
     blurred = F.conv2d(padded, kernel, groups=source.shape[1])
     weight = polar_weight.to(device=source.device, dtype=working.dtype)
     return (working * (1.0 - weight) + blurred * weight).to(dtype=source.dtype)
+
+
+def _polar_stereographic_directions(size: int, cap_degrees: float, north: bool, device: torch.device) -> torch.Tensor:
+    radius = math.tan(math.radians(cap_degrees) / 2.0)
+    axis = (torch.arange(size, device=device, dtype=torch.float32) + 0.5) * (2.0 / size) - 1.0
+    u, v = torch.meshgrid(axis * radius, axis * radius, indexing="xy")
+    r = torch.sqrt(u.square() + v.square())
+    theta = 2.0 * torch.atan(r)
+    scale = torch.where(r > 0, torch.sin(theta) / r, torch.zeros_like(r))
+    y = torch.cos(theta)
+    if not north:
+        y = -y
+    return torch.stack((u * scale, y, v * scale), dim=-1)
+
+
+def extract_polar_stereographic_patch(
+    image: Image.Image, size: int, cap_degrees: float, north: bool,
+) -> Image.Image:
+    """Sample a north or south ERP cap into a square stereographic patch."""
+    if size <= 0 or size % 16:
+        raise ValueError("patch size must be positive and divisible by 16.")
+    if not 0 < cap_degrees < 90:
+        raise ValueError("cap_degrees must be between zero and 90.")
+    image = image.convert("RGB")
+    source = torch.from_numpy(np.asarray(image).copy()).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+    directions = _polar_stereographic_directions(size, cap_degrees, north, source.device)
+    patch = _sample_circular_erp(source, _directions_to_grid(directions, image.height, image.width))
+    array = (patch[0].permute(1, 2, 0).clamp(0, 1) * 255).round().byte().numpy()
+    return Image.fromarray(array, "RGB")
+
+
+def fuse_polar_stereographic_patch(
+    base: Image.Image,
+    patch: Image.Image,
+    cap_degrees: float,
+    blend_start_degrees: float,
+    north: bool,
+) -> Image.Image:
+    """Reproject a stereographic patch into ERP and cosine-blend its polar cap."""
+    if not 0 <= blend_start_degrees < cap_degrees < 90:
+        raise ValueError("polar patch degrees must satisfy 0 <= blend start < cap < 90.")
+    base = base.convert("RGB")
+    patch = patch.convert("RGB")
+    base_tensor = torch.from_numpy(np.asarray(base).copy()).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+    patch_tensor = torch.from_numpy(np.asarray(patch).copy()).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+    directions = _erp_directions(base.height, base.width, base_tensor.device)
+    x, y, z = directions.unbind(dim=-1)
+    denominator = 1.0 + y if north else 1.0 - y
+    u, v = x / denominator.clamp_min(1e-6), z / denominator.clamp_min(1e-6)
+    radius = math.tan(math.radians(cap_degrees) / 2.0)
+    grid = torch.stack((u / radius, v / radius), dim=-1)
+    projected = F.grid_sample(patch_tensor, grid.unsqueeze(0), mode="bilinear", padding_mode="border", align_corners=False)
+    polar_y = y if north else -y
+    distance = torch.acos(polar_y.clamp(-1, 1)) * (180.0 / math.pi)
+    transition = ((distance - blend_start_degrees) / (cap_degrees - blend_start_degrees)).clamp(0, 1)
+    weight = (0.5 + 0.5 * torch.cos(math.pi * transition)).unsqueeze(0).unsqueeze(0)
+    output = base_tensor * (1.0 - weight) + projected * weight
+    array = (output[0].permute(1, 2, 0).clamp(0, 1) * 255).round().byte().numpy()
+    return Image.fromarray(array, "RGB")
 
 
 def early_polar_guidance_strength(

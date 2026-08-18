@@ -1,4 +1,3 @@
-import copy
 import torch
 import os
 import glob
@@ -165,8 +164,20 @@ class ImageStyleInference:
         return image
 
 
+
     @torch.no_grad()
-    def inference_with_latent_seam_sync(self, prompt, content, style, seed, num_inference_steps, centre_x_latent, centre_width_latent, blend_width_latent):
+    def inference_polar_patch(self, prompt, content, style, seed, num_inference_steps):
+        """Stylize one ordinary square polar patch as an independent image pass."""
+        if content.width != content.height or content.width % 16:
+            raise ValueError("polar patch must be square with a size divisible by 16.")
+        return self.pipe(
+            prompt, edit_image=[content.convert("RGB"), style.convert("RGB")], seed=seed,
+            num_inference_steps=num_inference_steps, height=content.height, width=content.width,
+            edit_image_auto_resize=False, cfg_scale=1.0,
+        )
+
+    @torch.no_grad()
+    def inference_with_latent_seam_sync(self, prompt, content, style, seed, num_inference_steps, centre_x_latent, centre_width_latent, blend_width_latent, return_latents=False):
         """Run Qwen-Image-Edit while synchronizing duplicate ERP latents."""
         pipe = self.pipe
         height, width = content.height, content.width
@@ -183,6 +194,9 @@ class ImageStyleInference:
             noise_pred = pipe.cfg_guided_model_fn(pipe.model_fn, 1.0, inputs_shared, inputs_posi, inputs_nega, **models, timestep=timestep, progress_id=progress_id)
             inputs_shared["latents"] = pipe.step(pipe.scheduler, progress_id=progress_id, noise_pred=noise_pred, **inputs_shared)
             synchronize_wrapped_latents(inputs_shared["latents"], centre_x_latent, centre_width_latent, blend_width_latent)
+        if return_latents:
+            pipe.load_models_to_device([])
+            return inputs_shared["latents"]
         pipe.load_models_to_device(["vae"])
         image = pipe.vae.decode(inputs_shared["latents"], device=pipe.device, tiled=False)
         image = pipe.vae_output_to_image(image)
@@ -213,6 +227,7 @@ class ImageStyleInference:
         polar_detail_end_degrees=88.0,
         polar_detail_radius_latent=24,
         polar_detail_steps=2,
+        return_latents=False,
     ):
         """Use early B predictions to guide A's polar geometry, then refine A alone."""
         if content_a.size != content_b.size:
@@ -336,6 +351,9 @@ class ImageStyleInference:
             synchronize_wrapped_latents(
                 inputs_b["latents"], centre_x_latent, centre_width_latent, blend_width_latent
             )
+        if return_latents:
+            pipe.load_models_to_device([])
+            return inputs_a["latents"]
         pipe.load_models_to_device(["vae"])
         image = pipe.vae.decode(inputs_a["latents"], device=pipe.device, tiled=False)
         image = pipe.vae_output_to_image(image)
