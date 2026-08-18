@@ -103,6 +103,11 @@ def stylize_panorama(
     polar_fusion_steps: int = 2,
     polar_fusion_strength: float = 1.0,
     polar_lowpass_radius_latent: int = 8,
+    polar_detail_limiter: bool = True,
+    polar_detail_start_degrees: float = 65.0,
+    polar_detail_end_degrees: float = 88.0,
+    polar_detail_radius_latent: int = 24,
+    polar_detail_steps: int = 2,
 ) -> tuple[Image.Image, int, Tuple[int, int]]:
     """Run one wrapped inference pass and return the seam-blended ERP."""
     content = content.convert("RGB")
@@ -126,6 +131,12 @@ def stylize_panorama(
             raise ValueError("polar blend degrees must satisfy 0 <= start < end < 90.")
         if polar_lowpass_radius_latent < 0:
             raise ValueError("polar-lowpass-radius-latent cannot be negative.")
+        if polar_detail_radius_latent < 0:
+            raise ValueError("polar-detail-radius-latent cannot be negative.")
+        if polar_detail_steps <= 0:
+            raise ValueError("polar-detail-steps must be greater than zero.")
+        if not 0 <= polar_detail_start_degrees < polar_detail_end_degrees < 90:
+            raise ValueError("polar detail degrees must satisfy 0 <= start < end < 90.")
 
     wrapped = make_wrapped_canvas(content, margin)
     working_content = resize_for_pipeline(wrapped)
@@ -147,7 +158,9 @@ def stylize_panorama(
             centre_x_latent, centre_width_latent, blend_width_latent,
             polar_rotation_degrees, polar_blend_start_degrees,
             polar_blend_end_degrees, polar_fusion_steps, polar_fusion_strength,
-            polar_lowpass_radius_latent,
+            polar_lowpass_radius_latent, polar_detail_limiter,
+            polar_detail_start_degrees, polar_detail_end_degrees,
+            polar_detail_radius_latent, polar_detail_steps,
         )
     else:
         generated = engine.inference_with_latent_seam_sync(
@@ -175,6 +188,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--polar-fusion-steps", type=int, default=2, help="Number of initial denoising steps guided by branch B")
     parser.add_argument("--polar-fusion-strength", type=float, default=1.0, help="Multiplier for the early B-to-A guidance schedule")
     parser.add_argument("--polar-lowpass-radius-latent", type=int, default=8, help="Maximum polar circular low-pass radius in latent pixels; zero disables it")
+    parser.add_argument("--polar-detail-limiter", action=argparse.BooleanOptionalAction, default=True, help="Limit oversampled polar detail during final A refinement")
+    parser.add_argument("--polar-detail-start-degrees", type=float, default=65.0, help="Latitude where final A detail limiting begins")
+    parser.add_argument("--polar-detail-end-degrees", type=float, default=88.0, help="Latitude where final A detail limiting reaches full weight")
+    parser.add_argument("--polar-detail-radius-latent", type=int, default=24, help="Maximum final A polar low-pass radius in latent pixels")
+    parser.add_argument("--polar-detail-steps", type=int, default=2, help="Number of final A denoising steps to limit polar detail")
     return parser.parse_args()
 
 
@@ -197,6 +215,9 @@ def main() -> None:
             args.polar_rotation_degrees, args.polar_blend_start_degrees,
             args.polar_blend_end_degrees, args.polar_fusion_steps,
             args.polar_fusion_strength, args.polar_lowpass_radius_latent,
+            args.polar_detail_limiter, args.polar_detail_start_degrees,
+            args.polar_detail_end_degrees, args.polar_detail_radius_latent,
+            args.polar_detail_steps,
         )
 
     output_path = Path(args.output)

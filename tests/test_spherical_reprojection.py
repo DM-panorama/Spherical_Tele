@@ -6,6 +6,8 @@ from telestyle_spherical import (
     SphericalLatentProjector,
     early_polar_guidance_strength,
     latitude_adaptive_circular_lowpass,
+    limit_polar_latent_detail,
+    make_polar_latitude_weight,
     make_circular_latent_canvas,
     make_rotated_latent_canvas,
 )
@@ -55,6 +57,24 @@ class SphericalReprojectionTests(unittest.TestCase):
         fused = projector.fuse_a_with_b(a, b, strength=0.7)
         self.assertAlmostEqual(fused[0, 0, 0, 0].item(), 0.7, places=5)
         self.assertEqual(fused[0, 0, 8, 0].item(), 0.0)
+
+    def test_polar_detail_limiter_preserves_equator_and_means_full_pole_row(self):
+        source = torch.zeros(1, 1, 180, 32)
+        source[0, 0, 0, 0] = 1.0
+        source[0, 0, 90, 3] = 1.0
+        weight = make_polar_latitude_weight(180, 32, 65.0, 88.0, torch.device("cpu"))
+        limited = limit_polar_latent_detail(source, weight, max_radius=8, pole_mean_rows=1)
+        self.assertTrue(torch.equal(limited[:, :, 90], source[:, :, 90]))
+        self.assertTrue(torch.allclose(limited[:, :, 0], limited[:, :, 0, :1].expand_as(limited[:, :, 0])))
+        self.assertGreater(limited[0, 0, 0, -1].item(), 0.0)
+
+    def test_polar_detail_limiter_does_not_mean_rows_before_full_weight(self):
+        source = torch.randn(1, 1, 16, 32)
+        weight = make_polar_latitude_weight(16, 32, 65.0, 88.0, torch.device("cpu"))
+        limited = limit_polar_latent_detail(source, weight, max_radius=0, pole_mean_rows=1)
+        self.assertTrue(torch.equal(limited, source))
+        with self.assertRaises(ValueError):
+            limit_polar_latent_detail(source, weight, max_radius=4, pole_mean_rows=-1)
 
     def test_latitude_adaptive_lowpass_preserves_equator_and_blurs_poles(self):
         source = torch.zeros(1, 1, 5, 16)

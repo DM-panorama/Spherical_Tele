@@ -9,6 +9,8 @@ from telestyle_spherical import (
     SphericalLatentProjector,
     early_polar_guidance_strength,
     latitude_adaptive_circular_lowpass,
+    limit_polar_latent_detail,
+    make_polar_latitude_weight,
     make_circular_latent_canvas,
     make_rotated_latent_canvas,
 )
@@ -206,6 +208,11 @@ class ImageStyleInference:
         polar_fusion_steps=2,
         polar_fusion_strength=1.0,
         polar_lowpass_radius_latent=8,
+        polar_detail_limiter=True,
+        polar_detail_start_degrees=65.0,
+        polar_detail_end_degrees=88.0,
+        polar_detail_radius_latent=24,
+        polar_detail_steps=2,
     ):
         """Use early B predictions to guide A's polar geometry, then refine A alone."""
         if content_a.size != content_b.size:
@@ -218,6 +225,12 @@ class ImageStyleInference:
             raise ValueError("polar_fusion_strength must be between zero and one.")
         if polar_lowpass_radius_latent < 0:
             raise ValueError("polar_lowpass_radius_latent cannot be negative.")
+        if polar_detail_radius_latent < 0:
+            raise ValueError("polar_detail_radius_latent cannot be negative.")
+        if polar_detail_steps <= 0:
+            raise ValueError("polar_detail_steps must be greater than zero.")
+        if not 0 <= polar_detail_start_degrees < polar_detail_end_degrees < 90:
+            raise ValueError("polar detail degrees must satisfy 0 <= start < end < 90.")
 
         pipe = self.pipe
         height, width = content_a.height, content_a.width
@@ -261,6 +274,11 @@ class ImageStyleInference:
         synchronize_wrapped_latents(
             inputs_b["latents"], centre_x_latent, centre_width_latent, blend_width_latent
         )
+        detail_weight = make_polar_latitude_weight(
+            inputs_a["latents"].shape[-2], centre_width_latent,
+            polar_detail_start_degrees, polar_detail_end_degrees,
+            inputs_a["latents"].device,
+        )
         pipe.load_models_to_device(pipe.in_iteration_models)
         models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
         guidance_steps = min(polar_fusion_steps, num_inference_steps)
@@ -302,6 +320,16 @@ class ImageStyleInference:
             inputs_b["latents"] = pipe.step(
                 scheduler_b, progress_id=progress_id, noise_pred=noise_pred_b, **inputs_b
             )
+            if polar_detail_limiter and progress_id >= num_inference_steps - min(polar_detail_steps, num_inference_steps):
+                a_centre = inputs_a["latents"][
+                    ..., centre_x_latent : centre_x_latent + centre_width_latent
+                ]
+                a_limited = limit_polar_latent_detail(
+                    a_centre, detail_weight, polar_detail_radius_latent
+                )
+                inputs_a["latents"] = make_circular_latent_canvas(
+                    a_limited, centre_x_latent, right_extension_width
+                )
             synchronize_wrapped_latents(
                 inputs_a["latents"], centre_x_latent, centre_width_latent, blend_width_latent
             )

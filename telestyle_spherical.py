@@ -86,6 +86,58 @@ def make_circular_latent_canvas(
     )
 
 
+def make_polar_latitude_weight(
+    height: int,
+    width: int,
+    start_degrees: float,
+    end_degrees: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return a cosine-ramped polar weight for an ERP latent grid."""
+    if height <= 0 or width <= 0:
+        raise ValueError("latent height and width must be positive.")
+    if not (0 <= start_degrees < end_degrees < 90):
+        raise ValueError("polar degrees must satisfy 0 <= start < end < 90.")
+    directions = _erp_directions(height, width, device)
+    latitude = directions[..., 1].asin().abs() * (180.0 / math.pi)
+    transition = ((latitude - start_degrees) / (end_degrees - start_degrees)).clamp(0, 1)
+    return (0.5 - 0.5 * torch.cos(math.pi * transition)).unsqueeze(0).unsqueeze(0)
+
+
+def limit_polar_latent_detail(
+    source: torch.Tensor,
+    polar_weight: torch.Tensor,
+    max_radius: int,
+    pole_mean_rows: int = 1,
+) -> torch.Tensor:
+    """Suppress oversampled polar longitude detail while preserving the equator."""
+    if pole_mean_rows < 0:
+        raise ValueError("pole_mean_rows cannot be negative.")
+    limited = latitude_adaptive_circular_lowpass(source, polar_weight, max_radius)
+    if pole_mean_rows == 0:
+        return limited
+
+    row_weight = polar_weight[0, 0, :, 0]
+    fully_polar = row_weight >= (1.0 - 1e-6)
+    top_rows = 0
+    while top_rows < min(pole_mean_rows, source.shape[-2]) and fully_polar[top_rows]:
+        top_rows += 1
+    bottom_rows = 0
+    while bottom_rows < min(pole_mean_rows, source.shape[-2]) and fully_polar[-1 - bottom_rows]:
+        bottom_rows += 1
+    if top_rows == 0 and bottom_rows == 0:
+        return limited
+
+    result = limited.clone()
+    if top_rows:
+        top_mean = result[..., :top_rows, :].float().mean(dim=-1, keepdim=True).to(result.dtype)
+        result[..., :top_rows, :] = top_mean.expand_as(result[..., :top_rows, :])
+    if bottom_rows:
+        bottom_mean = result[..., -bottom_rows:, :].float().mean(dim=-1, keepdim=True).to(result.dtype)
+        result[..., -bottom_rows:, :] = bottom_mean.expand_as(result[..., -bottom_rows:, :])
+    return result
+
+
 def latitude_adaptive_circular_lowpass(
     source: torch.Tensor,
     polar_weight: torch.Tensor,
