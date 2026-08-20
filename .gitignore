@@ -1,0 +1,14 @@
+weights/
+Wan2.1-T2V-1.3B-Diffusers/
+assets/
+inputs/
+qwen_style_output/
+results/
+results_video/
+inputs/zind_panos/
+inputs/styles/
+qwen_style_output/batch/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
