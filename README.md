@@ -68,37 +68,40 @@ We provide inference scripts for running TeleStyle-Image and TeleStyle-Video:
 python telestyleimage_inference.py
 ```
 
-#### Seam-aware Panorama Stylization
-对等距柱状全景图（ERP），请使用专用脚本。默认单分支模式会在生成前环形扩展左右边缘，
-并在每个去噪步骤同步重复的边缘 latent，最后裁取中心全景图，不进行 RGB 空间羽化。
+#### Spherical-chart Panorama Stylization
+对等距柱状全景图（ERP），请使用专用脚本。默认 `hemisphere` 模式会把输入分别投影成以南北极为中心的方形极射投影 chart；两张 chart 默认各越过赤道 `15°`。初始化 latent 后以及每个 scheduler step 后，程序都会在共同的赤道带内按球面坐标同步两份 latent。
 
-如需改善南北极附近的畸变，可启用双分支极区融合：脚本会额外生成绕 X 轴球面旋转后的 ERP，
-在最初若干步将其去噪预测旋回原坐标系并仅引导高纬区域，后续步骤仅由原始视角细化。该模式约增加一倍去噪时间。
+去噪完成后，南北 chart 先在潜空间重投影成一张 ERP latent，再增加左右循环 padding 和“纬度反射 + 经度半周平移”的极点 padding，最后只执行一次 VAE 解码。因此赤道、左右接缝和极点都不依赖生成后的 RGB 拼接。两张 chart 使用独立 scheduler 和 latent 轨迹，计算量约为两个同尺寸方形图的去噪。
 ```
 python telestylepanorama_inference.py \
   --content inputs/panorama.png \
   --style inputs/style.jpg \
-  --output qwen_style_output/panorama_result.png \
+  --output qwen_style_output/panorama_result.png
+
+# 可选：覆盖默认 chart 尺寸、15° 重叠带和 128px 解码 padding
+python telestylepanorama_inference.py \
+  --content inputs/panorama.png \
+  --style inputs/style.jpg \
+  --output qwen_style_output/panorama_custom.png \
+  --hemisphere-size 1024 \
+  --hemisphere-overlap-degrees 15 \
+  --decode-padding-px 128
+```
+输出保持输入全景图分辨率。`--hemisphere-size` 默认取输入 ERP 高度并对齐到 16；显式值必须为正且能被 16 整除。重叠角必须在 `0°–45°` 之间。方形 chart 的四角继续采样有效球面内容，不使用黑色圆外遮罩。
+
+旧环形 ERP、旋转双分支极区融合和最终 RGB 极区 patch 仍可通过显式 legacy 模式使用：
+```
+python telestylepanorama_inference.py \
+  --content inputs/panorama.png \
+  --style inputs/style.jpg \
+  --output qwen_style_output/panorama_legacy.png \
+  --panorama-mode legacy \
   --margin-px 256 \
   --blend-px 96
 
-# 可选：启用双分支极区融合（默认关闭）
-python telestylepanorama_inference.py \
-  --content inputs/panorama.png \
-  --style inputs/style.jpg \
-  --output qwen_style_output/panorama_polar_result.png \
-  --enable-polar-fusion \
-  --polar-rotation-degrees 90 \
-  --polar-blend-start-degrees 45 \
-  --polar-blend-end-degrees 75 \
-  --polar-fusion-steps 2 \
-  --polar-lowpass-radius-latent 8 \
-  --polar-detail-start-degrees 65 \
-  --polar-detail-end-degrees 88 \
-  --polar-detail-radius-latent 24 \
-  --polar-detail-steps 2
+# legacy 模式下仍可附加 --enable-polar-fusion 或 --enable-polar-patches
 ```
-输出保持输入全景图分辨率。双分支模式默认以 `0.35`、`0.20` 的系数引导最初两步；旋回后的 B 预测会在高纬做经度环形低通，`--polar-lowpass-radius-latent` 默认 `8`，设为 `0` 可关闭。A 在最后两步默认以 `65°–88°` 的纬度权重限制过采样极区细节，可用 `--no-polar-detail-limiter` 关闭。`--polar-fusion-strength` 为引导调度的倍率。若极点仍有大尺度畸变，可加 `--enable-polar-patches`：该模式会分别完成主 ERP、北极 `512×512` 立体投影 patch、南极 `512×512` 立体投影 patch 三次完整去噪，再在 RGB 空间将北、南 patch 以 `45°–60°` 余弦过渡带反投影融合回主 ERP。该模式不能与 `--enable-polar-fusion` 同时使用。其余参数可通过 `--help` 查看。
+旧极区参数仅在 `--panorama-mode legacy` 下生效；其余参数可通过 `--help` 查看。
 
 #### Video Stylization
 ```

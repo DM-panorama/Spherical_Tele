@@ -5,6 +5,9 @@ import torch
 from PIL import Image
 
 from telestyle_spherical import (
+    HemisphereLatentProjector,
+    extract_stereographic_hemisphere,
+    make_spherical_latent_canvas,
     SphericalLatentProjector,
     early_polar_guidance_strength,
     extract_polar_stereographic_patch,
@@ -150,6 +153,81 @@ class SphericalReprojectionTests(unittest.TestCase):
         canvas = make_circular_latent_canvas(centre, left_width=2, right_width=3)
         self.assertTrue(torch.equal(centre, original))
         self.assertTrue(torch.equal(canvas[0, 0, 0], torch.tensor([6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2])))
+
+    def test_stereographic_hemisphere_has_valid_square_content(self):
+        image = Image.new("RGB", (64, 32), (40, 80, 120))
+        north = extract_stereographic_hemisphere(image, 32, 15.0, north=True)
+        south = extract_stereographic_hemisphere(image, 32, 15.0, north=False)
+        self.assertEqual(north.size, (32, 32))
+        self.assertEqual(south.size, (32, 32))
+        expected = torch.tensor([40, 80, 120], dtype=torch.uint8)
+        self.assertTrue(torch.equal(torch.from_numpy(np.asarray(north).copy()[0, 0]), expected))
+        self.assertTrue(torch.equal(torch.from_numpy(np.asarray(south).copy()[-1, -1]), expected))
+
+    def test_hemisphere_sync_preserves_non_overlap_and_inputs(self):
+        projector = HemisphereLatentProjector(32, 15.0, torch.device("cpu"))
+        north = torch.zeros(1, 1, 32, 32)
+        south = torch.ones_like(north)
+        north_original = north.clone()
+        south_original = south.clone()
+        synced_north, synced_south = projector.synchronize(north, south)
+        self.assertTrue(torch.equal(north, north_original))
+        self.assertTrue(torch.equal(south, south_original))
+        self.assertTrue(torch.equal(
+            synced_north.masked_select(~projector.north_overlap),
+            north.masked_select(~projector.north_overlap),
+        ))
+        self.assertTrue(torch.equal(
+            synced_south.masked_select(~projector.south_overlap),
+            south.masked_select(~projector.south_overlap),
+        ))
+        self.assertGreater(
+            synced_north.masked_select(projector.north_overlap).max().item(), 0.0
+        )
+        self.assertLess(
+            synced_south.masked_select(projector.south_overlap).min().item(), 1.0
+        )
+
+    def test_hemisphere_composition_preserves_uniform_latents(self):
+        projector = HemisphereLatentProjector(16, 15.0, torch.device("cpu"))
+        north = torch.full((1, 2, 16, 16), 3.0)
+        south = torch.full_like(north, 3.0)
+        synced_north, synced_south = projector.synchronize(north, south)
+        erp = projector.compose_erp(synced_north, synced_south, 8, 16)
+        self.assertEqual(erp.shape, (1, 2, 8, 16))
+        self.assertTrue(torch.allclose(erp, torch.full_like(erp, 3.0), atol=1e-6))
+
+    def test_spherical_latent_canvas_uses_cross_pole_half_turn(self):
+        centre = torch.arange(3 * 8, dtype=torch.float32).view(1, 1, 3, 8)
+        canvas = make_spherical_latent_canvas(
+            centre, horizontal_padding=2, vertical_padding=1
+        )
+        self.assertEqual(canvas.shape, (1, 1, 5, 12))
+        self.assertTrue(torch.equal(canvas[..., 1:4, 2:10], centre))
+        expected_north = torch.roll(centre[..., 0, :], shifts=4, dims=-1)
+        expected_south = torch.roll(centre[..., -1, :], shifts=4, dims=-1)
+        self.assertTrue(torch.equal(canvas[..., 0, 2:10], expected_north))
+        self.assertTrue(torch.equal(canvas[..., -1, 2:10], expected_south))
+        self.assertTrue(torch.equal(canvas[..., :2], canvas[..., 8:10]))
+        self.assertTrue(torch.equal(canvas[..., -2:], canvas[..., 2:4]))
+
+
+    def test_hemisphere_round_trip_preserves_smooth_latitude_orientation(self):
+        height, width = 64, 128
+        latitude_ramp = np.linspace(255, 0, height, dtype=np.uint8)[:, None]
+        channel = np.repeat(latitude_ramp, width, axis=1)
+        image = Image.fromarray(np.stack((channel, channel, channel), axis=-1), "RGB")
+        north = extract_stereographic_hemisphere(image, 64, 15.0, north=True)
+        south = extract_stereographic_hemisphere(image, 64, 15.0, north=False)
+        north_tensor = torch.from_numpy(np.asarray(north).copy()).permute(2, 0, 1).unsqueeze(0).float() / 255
+        south_tensor = torch.from_numpy(np.asarray(south).copy()).permute(2, 0, 1).unsqueeze(0).float() / 255
+        reference = torch.from_numpy(np.asarray(image).copy()).permute(2, 0, 1).unsqueeze(0).float() / 255
+        projector = HemisphereLatentProjector(64, 15.0, torch.device("cpu"))
+        restored = projector.compose_erp(
+            north_tensor, south_tensor, height, width
+        )
+        self.assertLess((restored - reference).abs().mean().item(), 0.002)
+        self.assertLess((restored - reference).abs().max().item(), 0.02)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import copy
 import torch
 import os
 import glob
@@ -5,6 +6,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from telestyle_spherical import (
+    HemisphereLatentProjector,
     SphericalLatentProjector,
     early_polar_guidance_strength,
     latitude_adaptive_circular_lowpass,
@@ -12,6 +14,7 @@ from telestyle_spherical import (
     make_polar_latitude_weight,
     make_circular_latent_canvas,
     make_rotated_latent_canvas,
+    make_spherical_latent_canvas,
 )
 
 
@@ -359,6 +362,115 @@ class ImageStyleInference:
         image = pipe.vae_output_to_image(image)
         pipe.load_models_to_device([])
         return image
+
+    @torch.no_grad()
+    def inference_with_hemisphere_latent_sync(
+        self,
+        prompt,
+        content_north,
+        content_south,
+        style,
+        seed,
+        num_inference_steps,
+        output_height,
+        output_width,
+        overlap_degrees=15.0,
+        decode_padding_latent=16,
+        return_latents=False,
+    ):
+        """Denoise overlapping polar charts and decode one synchronized ERP."""
+        if content_north.size != content_south.size:
+            raise ValueError("north and south hemisphere charts must have identical sizes.")
+        if content_north.width != content_north.height or content_north.width % 16:
+            raise ValueError("hemisphere charts must be square and divisible by 16.")
+        if output_height <= 0 or output_width <= 0:
+            raise ValueError("ERP output dimensions must be positive.")
+        if output_height % 16 or output_width % 16:
+            raise ValueError("ERP output dimensions must be divisible by 16.")
+        if num_inference_steps <= 0:
+            raise ValueError("num_inference_steps must be greater than zero.")
+        if decode_padding_latent < 0:
+            raise ValueError("decode_padding_latent cannot be negative.")
+
+        pipe = self.pipe
+        chart_size = content_north.width
+        pipe.scheduler.set_timesteps(
+            num_inference_steps,
+            denoising_strength=1.0,
+            dynamic_shift_len=(chart_size // 16) ** 2,
+        )
+        scheduler_north = pipe.scheduler
+        scheduler_south = copy.deepcopy(scheduler_north)
+        inputs_north, posi_north, nega_north = _prepare_edit_inputs(
+            pipe, prompt, content_north, style, seed, num_inference_steps
+        )
+        inputs_south, posi_south, nega_south = _prepare_edit_inputs(
+            pipe, prompt, content_south, style, seed + 1, num_inference_steps
+        )
+        if inputs_north["latents"].shape != inputs_south["latents"].shape:
+            raise ValueError("hemisphere latent charts must have identical shapes.")
+
+        latent_size = inputs_north["latents"].shape[-1]
+        if inputs_north["latents"].shape[-2] != latent_size:
+            raise ValueError("hemisphere latent charts must be square.")
+        projector = HemisphereLatentProjector(
+            latent_size, overlap_degrees, inputs_north["latents"].device
+        )
+        inputs_north["latents"], inputs_south["latents"] = projector.synchronize(
+            inputs_north["latents"], inputs_south["latents"]
+        )
+
+        pipe.load_models_to_device(pipe.in_iteration_models)
+        models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
+        for progress_id, timestep in enumerate(tqdm(scheduler_north.timesteps)):
+            timestep = timestep.unsqueeze(0).to(
+                dtype=pipe.torch_dtype, device=pipe.device
+            )
+            noise_pred_north = pipe.cfg_guided_model_fn(
+                pipe.model_fn, 1.0, inputs_north, posi_north, nega_north,
+                **models, timestep=timestep, progress_id=progress_id,
+            )
+            noise_pred_south = pipe.cfg_guided_model_fn(
+                pipe.model_fn, 1.0, inputs_south, posi_south, nega_south,
+                **models, timestep=timestep, progress_id=progress_id,
+            )
+            inputs_north["latents"] = pipe.step(
+                scheduler_north, progress_id=progress_id,
+                noise_pred=noise_pred_north, **inputs_north
+            )
+            inputs_south["latents"] = pipe.step(
+                scheduler_south, progress_id=progress_id,
+                noise_pred=noise_pred_south, **inputs_south
+            )
+            inputs_north["latents"], inputs_south["latents"] = projector.synchronize(
+                inputs_north["latents"], inputs_south["latents"]
+            )
+
+        erp_latents = projector.compose_erp(
+            inputs_north["latents"], inputs_south["latents"],
+            output_height // 8, output_width // 8,
+        )
+        if return_latents:
+            pipe.load_models_to_device([])
+            return erp_latents
+        if decode_padding_latent > min(erp_latents.shape[-2:]):
+            raise ValueError("decode padding cannot exceed the ERP latent dimensions.")
+        decode_latents = make_spherical_latent_canvas(
+            erp_latents, decode_padding_latent, decode_padding_latent
+        )
+        pipe.load_models_to_device(["vae"])
+        image = pipe.vae.decode(decode_latents, device=pipe.device, tiled=False)
+        image = pipe.vae_output_to_image(image)
+        pipe.load_models_to_device([])
+
+        padding_px = decode_padding_latent * 8
+        if padding_px:
+            image = image.crop((
+                padding_px, padding_px,
+                padding_px + output_width, padding_px + output_height,
+            ))
+        return image
+
 
 if __name__ == "__main__":
     inference_engine = ImageStyleInference()
