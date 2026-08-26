@@ -10,8 +10,6 @@ from telestyle_spherical import (
     make_spherical_latent_canvas,
     SphericalLatentProjector,
     early_polar_guidance_strength,
-    extract_polar_stereographic_patch,
-    fuse_polar_stereographic_patch,
     latitude_adaptive_circular_lowpass,
     limit_polar_latent_detail,
     make_polar_latitude_weight,
@@ -102,20 +100,6 @@ class SphericalReprojectionTests(unittest.TestCase):
         self.assertEqual(filtered.shape, source.shape)
         with self.assertRaises(ValueError):
             latitude_adaptive_circular_lowpass(source, weight, -1)
-
-    def test_stereographic_polar_patch_round_trip_preserves_uniform_image(self):
-        image = Image.new("RGB", (64, 32), (80, 120, 160))
-        patch = extract_polar_stereographic_patch(image, 32, 60.0, north=True)
-        fused = fuse_polar_stereographic_patch(image, patch, 60.0, 45.0, north=True)
-        self.assertEqual(patch.size, (32, 32))
-        self.assertTrue(torch.equal(
-            torch.from_numpy(np.asarray(fused).copy()),
-            torch.from_numpy(np.asarray(image).copy()),
-        ))
-        with self.assertRaises(ValueError):
-            extract_polar_stereographic_patch(image, 30, 60.0, north=True)
-        with self.assertRaises(ValueError):
-            fuse_polar_stereographic_patch(image, patch, 45.0, 45.0, north=True)
 
     def test_early_guidance_schedule_uses_only_initial_steps(self):
         strengths = [early_polar_guidance_strength(step, 2) for step in range(4)]

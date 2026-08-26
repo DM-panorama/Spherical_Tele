@@ -1,124 +1,189 @@
-# <div align="center">TeleStyle:  Content-Preserving Style Transfer in Images and Videos</div>
-<div align="center">
-    Shiwen Zhang, Xiaoyan Yang, Bojia Zi, Haibin Huang, Chi Zhang, Xuelong Li
-    <br>
-    Institute of Artificial Intelligence, China Telecom (TeleAI) 
-</div>
-<br>
-<div align="center">
-    [<a href="https://tele-ai.github.io/TeleStyle/" target="_blank">Project Page</a>]
-    [<a href="http://arxiv.org/abs/2601.20175" target="_blank">arXiv</a>]
-    [<a href="https://huggingface.co/Tele-AI/TeleStyle" target="_blank">Hugging Face</a>]
-    [<a href="https://github.com/Tele-AI/TeleStyle" target="_blank">GitHub</a>]
-    [<a href="https://huggingface.co/spaces/witcherderivia/TeleStyle" target="_blank">Demo</a>]
-</div>
+# TeleStyle 图片与 ERP 全景图风格迁移
 
-## Abstract
-Content-preserving style transfer—generating stylized outputs based on content and style references—remains a significant challenge for Diffusion Transformers (DiTs) due to the inherent entanglement of content and style features in their internal representations. In this technical report, we present TeleStyle, a lightweight yet effective model for both image and video stylization. Built upon Qwen-Image-Edit, TeleStyle leverages the base model’s robust capabilities in content preservation and style customization. To facilitate effective training, we curated a high-quality dataset of distinct specific styles and further synthesized triplets using thousands of diverse, in-the-wild style categories. We introduce a Curriculum Continual Learning framework to train TeleStyle on this hybrid dataset of clean (curated) and noisy (synthetic) triplets. This approach enables the model to generalize to unseen styles without compromising precise content fidelity. Additionally, we introduce a video-to-video stylization module to enhance temporal consistency and visual quality. TeleStyle achieves state-of-the-art performance across three core evaluation metrics: style similarity, content consistency, and aesthetic quality.
+## 当前生图方法
 
-## Latest News
-- Released TeleStyleV2-SenseNova, [Code](https://huggingface.co/spaces/witcherderivia/TeleStyle-SenseNova/tree/main), [Model](https://huggingface.co/Tele-AI/TeleStyleV2), [Demo](https://huggingface.co/spaces/witcherderivia/TeleStyle-SenseNova), reinforces SenseNova U1 for Content-Preserving Style Transfer and preserves its general image editing capability. This experimental model is trained in pixel space, making the sft quite hard and still having much space to improve. The model supports 1MP to 4MP.
-- June 10, 2026: We release TeleStyleV2, supporting artistic content reference via self distillation. Released [Code](https://github.com/Tele-AI/TeleStyleV2), [Model](https://huggingface.co/Tele-AI/TeleStyleV2), [Demo](https://huggingface.co/spaces/witcherderivia/TeleStyleV2).
-- Jan 30, 2026: We refine the code and update requirements.txt. In addition, a new version of TeleStyle-Image model with better performance has been uploaded. Finally, we release a [free online demo for TeleStyle-Image ](https://huggingface.co/spaces/witcherderivia/TeleStyle). Please light a star to support this project if you find the demo useful. 
-- Jan 28, 2026: We release the <a href="http://arxiv.org/abs/2601.20175" target="_blank">technical report </a>, <a href="https://github.com/Tele-AI/TeleStyle" target="_blank">code</a> and <a href="https://huggingface.co/Tele-AI/TeleStyle" target="_blank">model</a> of TeleStyle.
+| 方法 | 入口 | 用途 |
+| --- | --- | --- |
+| 普通图片风格迁移 | `telestyleimage_inference.py` | 普通平面图片，脚本内使用硬编码示例路径 |
+| Hemisphere 双半球（默认、推荐） | `telestylepanorama_inference.py --panorama-mode hemisphere` | 南北半球 chart 独立去噪、赤道重叠区逐步同步，最后合成一个 ERP latent |
+| Legacy 环形画布 | `telestylepanorama_inference.py --panorama-mode legacy` | 通过 `[右边缘｜中心全景｜左边缘]` 环形画布同步左右接缝 |
+| Legacy 旋转双分支极区融合 | legacy 加 `--enable-polar-fusion` | 使用旋转后的 B 分支辅助 A 分支改善极区结构 |
 
-## Todo List
+推荐优先使用 `hemisphere`。两种 ERP legacy 路径主要用于兼容和对比。
 
-- [x] Release inference code
-- [x] Release models
-- [x] Release technical report
+## 环境与模型
 
+推荐使用 Python 3.11、支持 CUDA 的 PyTorch 和 NVIDIA GPU。安装依赖：
 
-
-## How to use
-
-### 1. Installation
-
-```
+```bash
 pip install -r requirements.txt
 ```
 
-This environment is tested with:
-- Python 3.11
-- PyTorch 2.9.1 + CUDA 12.1
-- diffusers 0.36.0
-- transformers 4.57.3
+图像基础模型路径当前固定在 `ImageStyleInference._load_models()` 中：
 
-### 2. Download Checkpoint
-
-Download the [Wan2.1-T2V-1.3B-Diffusers]([https://huggingface.co/Tele-AI/TeleStyle/tree/main](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers)) to a local path for example `./`.
-
-Download the [TeleStyle checkpoint](https://huggingface.co/Tele-AI/TeleStyle/tree/main) to a local path for example `./weights/`:
-
-We provide Image and Video checkpoint:
-
-- **Image (reference style image + content image -> stylized image)**  
-  diffsynth_Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors; diffsynth_Qwen-Image-Edit-2509-telestyle.safetensors
-  
-
-- **Video (stylized first frame + content video -> stylized video)**  
-  dit.ckpt; prompt_embeds.pth
-
-### 3. Inference
-
-We provide inference scripts for running TeleStyle-Image and TeleStyle-Video:
-
-#### Image Stylization
-```
-python telestyleimage_inference.py
+```text
+/root/autodl-tmp/Qwen-Image-Edit-2509
 ```
 
-#### Spherical-chart Panorama Stylization
-对等距柱状全景图（ERP），请使用专用脚本。默认 `hemisphere` 模式会把输入分别投影成以南北极为中心的方形极射投影 chart；两张 chart 默认各越过赤道 `15°`。初始化 latent 后以及每个 scheduler step 后，程序都会在共同的赤道带内按球面坐标同步两份 latent。
+该目录需要包含 Qwen-Image-Edit 的 transformer、text encoder、VAE 和 processor。TeleStyle 权重放在项目根目录的 `weights/`：
 
-去噪完成后，南北 chart 先在潜空间重投影成一张 ERP latent，再增加左右循环 padding 和“纬度反射 + 经度半周平移”的极点 padding，最后只执行一次 VAE 解码。因此赤道、左右接缝和极点都不依赖生成后的 RGB 拼接。两张 chart 使用独立 scheduler 和 latent 轨迹，计算量约为两个同尺寸方形图的去噪。
+```text
+weights/
+├── diffsynth_Qwen-Image-Edit-2509-telestyle.safetensors
+└── diffsynth_Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors
 ```
+
+`weights/` 已被 Git 忽略，不要把模型权重提交到仓库。
+
+## Hemisphere（双半球）方法（核心）
+
+### 适用输入
+
+内容图应为 ERP 等距柱状全景图，通常采用 `2:1` 宽高比，例如 `2048×1024`。代码要求输入至少为 `32×16` 像素。为了符合 DiT/VAE 网格，内部工作尺寸会对齐到 16 的倍数，最终结果仍恢复为原始输入分辨率。
+
+风格图可以是普通图片，进入模型前会缩放为 `1024×1024`。
+
+### 核心思路
+
+直接把 ERP 当作普通平面图片生成容易出现三个问题：
+
+- ERP 左右边缘在球面上实际相连，普通图片模型却会把它们视为两个边界。
+- ERP 在南北极附近存在严重的经度拉伸，平面处理不容易维持正确结构。
+- 分块生成后再拼 RGB，容易在赤道、左右接缝或极点留下可见拼接痕迹。
+
+`hemisphere` 方法先通过 ERP 像素中心和单位球方向，把同一张全景图重投影为南、北两个方形立体投影 chart。每个 chart 默认越过赤道 `15°`，因此双方在赤道附近观察到同一片球面区域，可以在 latent 空间持续同步。
+
+### 完整生图流程
+
+1. **读取并对齐尺寸**：内容图和风格图转换为 RGB；ERP 目标宽高对齐到 16 的倍数。
+2. **建立南北 chart**：以南极、北极为中心生成两个方形立体投影 chart。chart 的球面覆盖角为 `90° + overlap`，默认覆盖到对方半球 `15°`。
+3. **准备两份推理状态**：北、南 chart 分别建立 edit condition、scheduler 和 latent 轨迹；北分支使用 `seed`，南分支使用 `seed + 1`。
+4. **同步初始 latent**：通过球面方向映射，把两个 chart 的共同赤道带重投影到彼此坐标系，并按纬度置信权重融合。
+5. **逐步去噪并同步**：每个 scheduler step 中，两条分支分别预测并更新自己的 latent；更新后只同步双方共同的赤道带，不把一条分支的整份 latent 覆盖给另一条分支。
+6. **合成 ERP latent**：去噪结束后，把南北 chart 按 ERP 像素中心和单位球坐标重投影为一张 ERP latent，并在重叠纬度带平滑融合。
+7. **增加球面 padding**：左右方向使用循环 padding；跨越南北极时使用“纬度反射 + 经度半周平移”，保持真实球面拓扑。
+8. **只解码一次**：对带球面 padding 的最终 ERP latent 执行一次 VAE 解码，再裁掉 padding。默认流程不依赖生成后的 RGB 拼接。
+9. **恢复原尺寸并保存**：如果内部对齐改变了尺寸，结果会缩放回输入 ERP 的原始宽高；输出目录会自动创建。
+
+南北分支各自完成一次方形 chart 去噪，因此计算量和显存需求通常高于普通单图推理。
+
+### 最简指令
+
+`hemisphere` 是默认模式，下面的命令即可运行：
+
+```bash
 python telestylepanorama_inference.py \
   --content inputs/panorama.png \
   --style inputs/style.jpg \
   --output qwen_style_output/panorama_result.png
+```
 
-# 可选：覆盖默认 chart 尺寸、15° 重叠带和 128px 解码 padding
+### 完整指令
+
+```bash
 python telestylepanorama_inference.py \
   --content inputs/panorama.png \
   --style inputs/style.jpg \
-  --output qwen_style_output/panorama_custom.png \
+  --output qwen_style_output/panorama_result.png \
+  --panorama-mode hemisphere \
+  --prompt "Transfer the style of Figure 2 to the equirectangular panorama in Figure 1. Preserve the panorama geometry and seamless horizontal wrap-around continuity." \
+  --seed 123 \
+  --steps 4 \
   --hemisphere-size 1024 \
   --hemisphere-overlap-degrees 15 \
   --decode-padding-px 128
 ```
-输出保持输入全景图分辨率。`--hemisphere-size` 默认取输入 ERP 高度并对齐到 16；显式值必须为正且能被 16 整除。重叠角必须在 `0°–45°` 之间。方形 chart 的四角继续采样有效球面内容，不使用黑色圆外遮罩。
 
-旧环形 ERP、旋转双分支极区融合和最终 RGB 极区 patch 仍可通过显式 legacy 模式使用：
+### Hemisphere 参数
+
+| 参数 | 默认值 | 说明 |
+| --- | ---: | --- |
+| `--content` | 必填 | ERP 内容图路径 |
+| `--style` | 必填 | 风格参考图路径 |
+| `--output` | 必填 | 输出路径，父目录不存在时自动创建 |
+| `--prompt` | 内置 ERP 提示词 | 编辑指令 |
+| `--seed` | `123` | 北分支随机种子；南分支使用该值加 1 |
+| `--steps` | `4` | 去噪步数，必须大于 0 |
+| `--panorama-mode` | `hemisphere` | 全景图方法，可选 `hemisphere` 或 `legacy` |
+| `--hemisphere-size` | 输入 ERP 高度对齐到 16 | 单个方形 chart 的边长；显式设置时必须为正且能被 16 整除 |
+| `--hemisphere-overlap-degrees` | `15` | 南北 chart 越过赤道的角度，必须严格位于 `0°–45°` 之间 |
+| `--decode-padding-px` | `128` | 最终 ERP VAE 解码前使用的球面 padding；会限制到有效尺寸并向下对齐到 16 |
+
+如果输入是 `2048×1024` ERP，省略 `--hemisphere-size` 时，chart 默认就是 `1024×1024`。输入高度较大时可以显式降低 chart 尺寸以节省计算量，但细节也可能减少。
+
+`--enable-polar-fusion` 只允许配合 `--panorama-mode legacy`，不能用于 `hemisphere`。
+
+### Hemisphere 问题
+
+有问题的主要是 **完整生图流程** 里的第 6 步：**合成 ERP latent**：去噪结束后，把南北 chart 按 ERP 像素中心和单位球坐标重投影为一张 ERP latent，并在重叠纬度带平滑融合。
+
+这导致了两个问题：
+
+1. 这里把两张极坐标的 latent 做了重投影，合成一张 ERP latent ，但是 latent 不能像 RGB 图像一样非线性变换，拉伸、压缩、插值都会影响高频，所以生成的效果图物体结构（低频）很好，但是笔触细节（高频）很碎，抖动感明显，有锯齿形纹路
+
+2. 这个方法本质上，两张半球的图是独立的，知识在 VAE 编码的时候有一点联系，这样的联系并补紧密，所以最终融合的时候，赤道处接缝不太理想，如果要保持锐利就对不齐，如果要融合就会偏软。
+
+   此方法处理赤道接缝与环形画布处理左右接缝处比较，环形画布表现很好的原因之一是，它的左右是可以直接平移并拼接的，最终得到的是一整张图，而这个方法把球面分成两份，二者之间的联系就减弱了，所以接缝处不如环形画布那么自然
+
+## 其他生图方法
+
+### 普通图片风格迁移
+
+普通图片入口是硬编码示例。运行前在 `telestyleimage_inference.py` 的 `__main__` 中修改：
+
+```python
+content_ref = "inputs/content.png"
+style_ref = "inputs/style.jpg"
 ```
+
+然后执行：
+
+```bash
+python telestyleimage_inference.py
+```
+
+默认使用 4 个推理步、随机种子 `123`，并把内容图短边对齐为 `1024`。结果保存到：
+
+```text
+qwen_style_output/<风格图文件名>_result.png
+```
+
+### Legacy 环形 ERP
+
+Legacy 基础模式把内容图扩展为 `[右边缘 | 中心全景 | 左边缘]`，初始化 latent 后以及每次 scheduler 更新后同步重复的左右边缘区域，最后裁出中心 ERP 并恢复原分辨率。
+
+```bash
 python telestylepanorama_inference.py \
   --content inputs/panorama.png \
   --style inputs/style.jpg \
   --output qwen_style_output/panorama_legacy.png \
   --panorama-mode legacy \
   --margin-px 256 \
-  --blend-px 96
-
-# legacy 模式下仍可附加 --enable-polar-fusion 或 --enable-polar-patches
-```
-旧极区参数仅在 `--panorama-mode legacy` 下生效；其余参数可通过 `--help` 查看。
-
-#### Video Stylization
-```
-python telestylevideo_inference.py --video_path assets/example/1.mp4 --image_path assets/example/1-0.png --output_path results
+  --blend-px 96 \
+  --steps 4 \
+  --seed 123
 ```
 
-### ComfyUI
-Thanks to the community for providing the ComfyUI implementation:
-- [aistudynow/Comfyui-tetestyle-image-video](https://github.com/aistudynow/Comfyui-tetestyle-image-video)
-- [neurodanzelus-cmd/ComfyUI-TeleStyle](https://github.com/neurodanzelus-cmd/ComfyUI-TeleStyle)
+`--margin-px` 必须大于 0，实际值会限制到 ERP 宽度的一半并对齐到 16；`--blend-px` 不能为负，也不能大于有效 margin。
 
-## Citation
-If you find TeleStyle useful in your research, please light a star for the project and cite our paper, thank you:
-```bibtex
-@article{teleai2026telestyle,
-    title={TeleStyle: Content-Preserving Style Transfer in Images and Videos}, 
-    author={Shiwen Zhang and Xiaoyan Yang and Bojia Zi and Haibin Huang and Chi Zhang and Xuelong Li},
-    journal={arXiv preprint arXiv:2601.20175},
-    year={2026}
-}
+### Legacy 旋转双分支极区融合
+
+该模式为原始 ERP 建立 A 分支，并把 ERP 绕 X 轴做球面旋转后建立 B 分支。A/B 保持独立 scheduler 和 latent 轨迹；B 分支对齐后的去噪预测用于引导 A 的极区，最终只解码 A。
+
+```bash
+python telestylepanorama_inference.py \
+  --content inputs/panorama.png \
+  --style inputs/style.jpg \
+  --output qwen_style_output/panorama_polar_fusion.png \
+  --panorama-mode legacy \
+  --enable-polar-fusion \
+  --margin-px 256 \
+  --blend-px 96 \
+  --polar-rotation-degrees 90 \
+  --polar-blend-start-degrees 45 \
+  --polar-blend-end-degrees 75 \
+  --polar-fusion-steps 2 \
+  --polar-fusion-strength 1.0
+```
+
+其他可调参数可通过 `python telestylepanorama_inference.py --help` 查看，包括极区低通半径和最终细节限制参数。

@@ -9,12 +9,14 @@
 - `telestyleimage_inference.py`：Qwen Image Edit 与 TeleStyle 图像 LoRA。其 `__main__` 块是一个硬编码的小型示例。
 - `telestylepanorama_inference.py`：接缝感知 ERP 全景图命令行流程，导入图像脚本中的 `ImageStyleInference`。
 - `telestyle_spherical.py`：无模型依赖的 ERP 球面重投影、X 轴旋转与纬度融合工具。
+- `telestylevideo_inference.py`：视频推理入口及 CLI 参数解析。
+- `telestylevideo_pipeline.py` 和 `telestylevideo_transformer.py`：视频模型内部实现。
 - `inputs/` 与 `assets/`：已跟踪的示例和文档素材。
-- `weights/`、模型缓存与生成结果目录：本地运行数据；不要将大型产物提交到 Git。
+- `weights/`、`Wan2.1-T2V-1.3B-Diffusers/`、模型缓存与生成结果目录：本地运行数据；不要将大型产物提交到 Git。
 
 ## 环境与权重
 
-- 目标环境为 Python 3.11 和支持 CUDA 的 PyTorch。图像与全景图推理依赖 CUDA 和大模型权重，不应预期它们能在仅 CPU 的 CI 环境中完整运行。
+- 目标环境为 Python 3.11 和支持 CUDA 的 PyTorch。图像与视频推理均依赖 CUDA 和大模型权重，不应预期它们能在仅 CPU 的 CI 环境中完整运行。
 - 使用 `pip install -r requirements.txt` 安装依赖；DiffSynth 依赖固定到一个 Git commit。
 - 图像推理的基础模型路径目前在 `ImageStyleInference._load_models()` 中与机器路径绑定。除非任务明确要求路径可配置化，否则保持该行为；任何路径变更都要同步更新 `README.md`。
 - 权重文件名及预期目录结构需与 README 保持一致。除非明确要求，绝不提交权重、模型缓存或生成媒体文件。
@@ -33,7 +35,7 @@
 修改后运行最轻量且相关的检查：
 
 ```bash
-python -m py_compile telestyleimage_inference.py telestylepanorama_inference.py telestyle_spherical.py
+python -m py_compile telestyleimage_inference.py telestylepanorama_inference.py telestylevideo_inference.py telestyle_spherical.py
 python -m unittest tests/test_spherical_reprojection.py
 ```
 
