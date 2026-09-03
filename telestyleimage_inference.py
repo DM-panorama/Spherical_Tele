@@ -2,6 +2,7 @@ import copy
 import torch
 import os
 import glob
+from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
 
@@ -77,12 +78,16 @@ class ImageStyleInference:
     def __init__(self,):
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.sphere_model = None
+        self.sphere_config = None
+        self.sphere_checkpoint_info = None
 
         self._load_models()
     
     def _load_models(self):
 
           model_dir = "/root/autodl-tmp/Qwen-Image-Edit-2509"
+          self.model_dir = model_dir
 
           self.pipe = QwenImagePipeline.from_pretrained(
               torch_dtype=torch.bfloat16,
@@ -127,6 +132,106 @@ class ImageStyleInference:
 
           self.pipe.load_lora(self.pipe.dit, telestyle_image)
           self.pipe.load_lora(self.pipe.dit, speedup)
+
+    def load_sphere_adapter(
+        self, config_path, checkpoint_path, expected_chart_size=None,
+    ):
+        """Load an EMA A1 SphereAdapter beside the LoRA-merged DiT."""
+        from training.checkpoint import (
+            dependency_hashes, sha256_file, validate_adapter_metadata,
+        )
+        from training.config import load_config
+        from training.models import configured_lora_paths
+        from training.joint_qwen import JointQwenSphereModel
+        from training.sphere_adapter import SphereAdapter
+
+        checkpoint_path = Path(checkpoint_path)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"A1 checkpoint does not exist: {checkpoint_path}"
+            )
+        config = load_config(config_path)
+        payload = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=False
+        )
+        if payload.get("format") != "telestyle-sphere-adapter-a1-v1":
+            raise ValueError("unsupported SphereAdapter checkpoint format.")
+        metadata = dict(payload.get("metadata", {}))
+        checkpoint_chart_size = int(metadata.get("chart_size", 0))
+        if expected_chart_size is not None and (
+            checkpoint_chart_size != int(expected_chart_size)
+        ):
+            raise ValueError(
+                "A1 checkpoint chart size does not match hemisphere-size: "
+                f"checkpoint={checkpoint_chart_size}, "
+                f"hemisphere-size={expected_chart_size}."
+            )
+        transformer_index = (
+            Path(self.model_dir) / "transformer"
+            / "diffusion_pytorch_model.safetensors.index.json"
+        )
+        expected_hash = metadata.get("base_transformer_index_sha256")
+        if expected_hash:
+            if not transformer_index.is_file():
+                raise FileNotFoundError(
+                    f"base transformer index does not exist: {transformer_index}"
+                )
+            actual_hash = sha256_file(transformer_index)
+            if actual_hash != expected_hash:
+                raise ValueError(
+                    "A1 checkpoint was trained against a different base "
+                    "transformer index."
+                )
+        if int(metadata.get("schema_version", 1)) >= 2:
+            lora_paths = configured_lora_paths(config, config_path)
+            chart_size = checkpoint_chart_size or int(expected_chart_size)
+            self.pipe.scheduler.set_timesteps(
+                4, denoising_strength=1.0, dynamic_shift_len=(chart_size // 16) ** 2
+            )
+            validate_adapter_metadata(
+                metadata,
+                base_transformer_sha256=sha256_file(transformer_index),
+                lora_sha256=dependency_hashes(lora_paths),
+                prompt=str(config.training.prompt),
+                lightning_timesteps=[
+                    float(value.detach().cpu())
+                    for value in self.pipe.scheduler.timesteps
+                ],
+                south_yaw_degrees=float(config.training.south_yaw_degrees),
+            )
+        ema = payload.get("ema", {})
+        if "shadow" not in ema:
+            raise ValueError("A1 checkpoint does not contain EMA adapter weights.")
+
+        adapter = SphereAdapter(
+            hidden_dim=int(config.model.hidden_dim),
+            adapter_dim=int(config.model.adapter_dim),
+            num_heads=int(config.model.num_heads),
+            global_tokens=int(config.model.global_tokens),
+            equator_tokens=int(config.model.equator_tokens),
+        ).to(device=self.device, dtype=self.pipe.torch_dtype)
+        model = JointQwenSphereModel(
+            self.pipe.dit, adapter,
+            injection_stride=int(config.model.injection_stride),
+            use_gradient_checkpointing=False,
+        )
+        model.adapter.load_state_dict(ema["shadow"], strict=True)
+        with torch.no_grad():
+            model.injection_gates.copy_(
+                payload["injection_gates"].to(
+                    device=self.device, dtype=self.pipe.torch_dtype
+                )
+            )
+        model.eval()
+        self.sphere_model = model
+        self.sphere_config = config
+        self.sphere_checkpoint_info = {
+            "path": str(checkpoint_path.resolve()),
+            "step": int(payload.get("step", 0)),
+            "metadata": metadata,
+        }
+        del payload
+        return dict(self.sphere_checkpoint_info)
 
     def inference(self,
         prompt,
@@ -458,6 +563,264 @@ class ImageStyleInference:
                 padding_px, padding_px,
                 padding_px + output_width, padding_px + output_height,
             ))
+        return image
+
+
+    @torch.no_grad()
+    def inference_with_hemisphere_rgb_hard_cut(
+        self,
+        prompt,
+        content_north,
+        content_south,
+        style,
+        seed,
+        num_inference_steps,
+        output_height,
+        output_width,
+        overlap_degrees=15.0,
+        consistency_degrees=10.0,
+        return_latents=False,
+    ):
+        """Denoise independent base-model charts and hard-cut decoded RGB."""
+        if content_north.size != content_south.size:
+            raise ValueError("north and south hemisphere charts must have identical sizes.")
+        if content_north.width != content_north.height or content_north.width % 16:
+            raise ValueError("hemisphere charts must be square and divisible by 16.")
+        if output_height <= 0 or output_width <= 0:
+            raise ValueError("ERP output dimensions must be positive.")
+        if output_height % 16 or output_width % 16:
+            raise ValueError("ERP output dimensions must be divisible by 16.")
+        if output_width != 2 * output_height:
+            raise ValueError("RGB hard-cut output must have a 2:1 aspect ratio.")
+        if num_inference_steps <= 0:
+            raise ValueError("num_inference_steps must be greater than zero.")
+
+        from training.geometry import reproject_native_charts
+
+        pipe = self.pipe
+        chart_size = content_north.width
+        pipe.scheduler.set_timesteps(
+            num_inference_steps,
+            denoising_strength=1.0,
+            dynamic_shift_len=(chart_size // 16) ** 2,
+        )
+        scheduler_north = pipe.scheduler
+        scheduler_south = copy.deepcopy(scheduler_north)
+        inputs_north, posi_north, nega_north = _prepare_edit_inputs(
+            pipe, prompt, content_north, style, seed, num_inference_steps
+        )
+        inputs_south, posi_south, nega_south = _prepare_edit_inputs(
+            pipe, prompt, content_south, style, seed + 1, num_inference_steps
+        )
+        if inputs_north["latents"].shape != inputs_south["latents"].shape:
+            raise ValueError("hemisphere latent charts must have identical shapes.")
+        latent_size = inputs_north["latents"].shape[-1]
+        if inputs_north["latents"].shape[-2] != latent_size:
+            raise ValueError("hemisphere latent charts must be square.")
+
+        projector = HemisphereLatentProjector(
+            latent_size, overlap_degrees, inputs_north["latents"].device
+        )
+        inputs_north["latents"], inputs_south["latents"] = projector.synchronize(
+            inputs_north["latents"], inputs_south["latents"]
+        )
+        inputs_north["noise"] = inputs_north["latents"]
+        inputs_south["noise"] = inputs_south["latents"]
+
+        pipe.load_models_to_device(pipe.in_iteration_models)
+        models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
+        for progress_id, timestep in enumerate(
+            tqdm(scheduler_north.timesteps, desc="TeleStyle RGB hard-cut (no A1)")
+        ):
+            timestep = timestep.unsqueeze(0).to(
+                dtype=pipe.torch_dtype, device=pipe.device
+            )
+            noise_pred_north = pipe.cfg_guided_model_fn(
+                pipe.model_fn, 1.0, inputs_north, posi_north, nega_north,
+                **models, timestep=timestep, progress_id=progress_id,
+            )
+            noise_pred_south = pipe.cfg_guided_model_fn(
+                pipe.model_fn, 1.0, inputs_south, posi_south, nega_south,
+                **models, timestep=timestep, progress_id=progress_id,
+            )
+            inputs_north["latents"] = pipe.step(
+                scheduler_north, progress_id=progress_id,
+                noise_pred=noise_pred_north, **inputs_north
+            )
+            inputs_south["latents"] = pipe.step(
+                scheduler_south, progress_id=progress_id,
+                noise_pred=noise_pred_south, **inputs_south
+            )
+
+        if return_latents:
+            pipe.load_models_to_device([])
+            return inputs_north["latents"], inputs_south["latents"]
+        pipe.load_models_to_device(["vae"])
+        north_decoded = pipe.vae.decode(
+            inputs_north["latents"], device=pipe.device, tiled=False
+        )
+        south_decoded = pipe.vae.decode(
+            inputs_south["latents"], device=pipe.device, tiled=False
+        )
+        projected = reproject_native_charts(
+            north_decoded, south_decoded, overlap_degrees,
+            consistency_degrees, output_height, output_width,
+            antialias_scale=2,
+            # Both charts use the same ERP longitude convention.
+            south_yaw_degrees=0.0,
+        )
+        image = pipe.vae_output_to_image(projected.hard_cut)
+        del north_decoded, south_decoded, projected
+        pipe.load_models_to_device([])
+        return image
+
+
+    @torch.no_grad()
+    def inference_with_hemisphere_sphere_adapter(
+        self,
+        prompt,
+        content_north,
+        content_south,
+        style,
+        seed,
+        num_inference_steps,
+        output_height,
+        output_width,
+        overlap_degrees=15.0,
+        decode_padding_latent=16,
+        return_latents=False,
+        return_chart_images=False,
+    ):
+        """Denoise independent hemispheres and hard-cut decoded RGB charts."""
+        if return_latents and return_chart_images:
+            raise ValueError(
+                "return_latents and return_chart_images cannot both be enabled."
+            )
+        if self.sphere_model is None or self.sphere_config is None:
+            raise RuntimeError("load_sphere_adapter must be called before A1 inference.")
+        if content_north.size != content_south.size:
+            raise ValueError("north and south hemisphere charts must have identical sizes.")
+        if content_north.width != content_north.height or content_north.width % 16:
+            raise ValueError("hemisphere charts must be square and divisible by 16.")
+        if output_height <= 0 or output_width <= 0:
+            raise ValueError("ERP output dimensions must be positive.")
+        if output_height % 16 or output_width % 16:
+            raise ValueError("ERP output dimensions must be divisible by 16.")
+        if output_width != 2 * output_height:
+            raise ValueError("A1 RGB hard-cut output must have a 2:1 aspect ratio.")
+        if num_inference_steps <= 0:
+            raise ValueError("num_inference_steps must be greater than zero.")
+        if decode_padding_latent < 0:
+            raise ValueError("decode padding cannot be negative.")
+
+        from training.geometry import build_sphere_geometry, reproject_native_charts
+
+        pipe = self.pipe
+        chart_size = content_north.width
+        checkpoint_chart_size = int(
+            self.sphere_checkpoint_info["metadata"].get("chart_size", 0)
+        )
+        if checkpoint_chart_size != chart_size:
+            raise ValueError(
+                "A1 checkpoint chart size does not match the input charts: "
+                f"checkpoint={checkpoint_chart_size}, charts={chart_size}."
+            )
+        pipe.scheduler.set_timesteps(
+            num_inference_steps,
+            denoising_strength=1.0,
+            dynamic_shift_len=(chart_size // 16) ** 2,
+        )
+        scheduler_north = pipe.scheduler
+        scheduler_south = copy.deepcopy(scheduler_north)
+        inputs_north, posi_north, _ = _prepare_edit_inputs(
+            pipe, prompt, content_north, style, seed, num_inference_steps
+        )
+        inputs_south, posi_south, _ = _prepare_edit_inputs(
+            pipe, prompt, content_south, style, seed + 1, num_inference_steps
+        )
+        if inputs_north["latents"].shape != inputs_south["latents"].shape:
+            raise ValueError("hemisphere latent charts must have identical shapes.")
+        latent_size = inputs_north["latents"].shape[-1]
+        if inputs_north["latents"].shape[-2] != latent_size:
+            raise ValueError("hemisphere latent charts must be square.")
+
+        projector = HemisphereLatentProjector(
+            latent_size, overlap_degrees, inputs_north["latents"].device
+        )
+        inputs_north["latents"], inputs_south["latents"] = projector.synchronize(
+            inputs_north["latents"], inputs_south["latents"]
+        )
+        inputs_north["noise"] = inputs_north["latents"]
+        inputs_south["noise"] = inputs_south["latents"]
+        geometry = build_sphere_geometry(
+            latent_size // 2,
+            overlap_degrees,
+            float(self.sphere_config.data.consistency_degrees),
+            int(self.sphere_config.model.correspondence_neighbors),
+            inputs_north["latents"].device,
+        )
+
+        pipe.load_models_to_device(pipe.in_iteration_models)
+        for progress_id, timestep in enumerate(
+            tqdm(scheduler_north.timesteps, desc="TeleStyle + A1")
+        ):
+            timestep = timestep.unsqueeze(0).to(
+                dtype=pipe.torch_dtype, device=pipe.device
+            )
+            noise_pred_north, noise_pred_south = self.sphere_model(
+                inputs_north["latents"],
+                inputs_south["latents"],
+                inputs_north["edit_latents"],
+                inputs_south["edit_latents"],
+                posi_north["prompt_emb"],
+                posi_south["prompt_emb"],
+                posi_north["prompt_emb_mask"],
+                posi_south["prompt_emb_mask"],
+                timestep,
+                geometry,
+                disable_cross_chart=False,
+            )
+            inputs_north["latents"] = pipe.step(
+                scheduler_north, progress_id=progress_id,
+                noise_pred=noise_pred_north, **inputs_north
+            )
+            inputs_south["latents"] = pipe.step(
+                scheduler_south, progress_id=progress_id,
+                noise_pred=noise_pred_south, **inputs_south
+            )
+
+        if return_latents:
+            pipe.load_models_to_device([])
+            return inputs_north["latents"], inputs_south["latents"]
+
+        pipe.load_models_to_device(["vae"])
+        north_decoded = pipe.vae.decode(
+            inputs_north["latents"], device=pipe.device, tiled=False
+        )
+        south_decoded = pipe.vae.decode(
+            inputs_south["latents"], device=pipe.device, tiled=False
+        )
+        projected = reproject_native_charts(
+            north_decoded,
+            south_decoded,
+            overlap_degrees,
+            float(self.sphere_config.data.consistency_degrees),
+            output_height,
+            output_width,
+            antialias_scale=2,
+            # Keep extraction and reprojection longitude conventions inverse.
+            south_yaw_degrees=0.0,
+        )
+        image = pipe.vae_output_to_image(projected.hard_cut)
+        north_image = None
+        south_image = None
+        if return_chart_images:
+            north_image = pipe.vae_output_to_image(north_decoded)
+            south_image = pipe.vae_output_to_image(south_decoded)
+        del north_decoded, south_decoded, projected
+        pipe.load_models_to_device([])
+        if return_chart_images:
+            return image, north_image, south_image
         return image
 
 

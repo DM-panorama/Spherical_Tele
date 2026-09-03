@@ -187,3 +187,80 @@ python telestylepanorama_inference.py \
 ```
 
 其他可调参数可通过 `python telestylepanorama_inference.py --help` 查看，包括极区低通半径和最终细节限制参数。
+
+## A1 SphereAdapter 纯球面几何训练
+
+A1 只使用高质量、连续的 2:1 ERP，不加载 TeleStyle 或 Lightning LoRA，也不需要风格图和风格化真值。数据和缓存的本地目录为：
+
+```text
+data/a1/
+├── erp/Structured3D/  # scene_xxxxx/<view_id>/rgb_*.png
+├── manifests/    # 自动生成 train/validation/test 清单
+├── cache/        # VAE latent 和固定文本条件缓存
+└── stress/       # 程序生成的高频压力样本
+```
+
+放入 ERP 后先扫描数据并生成清单：
+
+```bash
+python -m training.prepare_a1_data --config configs/a1.yaml
+```
+
+CUDA 可用且磁盘空间满足估算后，构建四个确定性球面增强缓存：
+
+```bash
+python -m training.prepare_a1_data --config configs/a1.yaml --build-cache --variants 4
+```
+
+启动或恢复 20k-step A1 训练，并对检查点执行硬接缝消融评估：
+
+```bash
+python -m training.train_sphere_adapter --config configs/a1.yaml
+python -m training.train_sphere_adapter --config configs/a1.yaml --resume outputs/a1/a1_step_002000.pt
+python -m training.evaluate_a1 --config configs/a1.yaml --checkpoint outputs/a1/a1_step_020000.pt
+```
+
+为固定 validation 样本输出零门控基线、完整 Adapter 和关闭跨球面通信三组 ERP，
+并生成横向三联图：
+
+```bash
+python -m training.evaluate_a1 \
+    --config configs/a1_pilot_v2.yaml \
+    --checkpoint outputs/a1_pilot_v2/a1_step_000075.pt \
+    --max-samples 4 \
+    --comparison-samples 4 \
+    --save-comparison-images
+```
+
+该可选评估功能不改变原有内容图加风格图的全景生图命令或默认输出。
+
+### TeleStyle + A1 单命令 A/B 验证
+
+下面的命令在同一进程中固定内容图、风格图、prompt、seed、步数和半球尺寸，依次生成原版 TeleStyle 与加载 EMA SphereAdapter 的实验版本：
+
+```bash
+conda activate telestyle311
+export OMP_NUM_THREADS=8
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+
+python telestylepanorama_inference.py \
+    --content inputs/panorama.png \
+    --style inputs/style.jpg \
+    --output outputs/ab_test/telestyle_a1.png \
+    --panorama-mode hemisphere \
+    --hemisphere-size 1024 \
+    --steps 4 \
+    --seed 123 \
+    --a1-config configs/a1_pilot_v2.yaml \
+    --a1-checkpoint outputs/a1_pilot_v2/a1_step_000075.pt \
+    --a1-ab-test \
+    --save-a1-chart-images
+```
+
+A/B 模式一次生成五张图片：`telestyle_a1_rgb_hardcut_baseline.png`（原版 latent 合成 baseline）、`telestyle_no_a1_rgb_hardcut.png`（无 A1 的独立双半球 RGB 硬拼）、`telestyle_a1_rgb_hardcut.png`（A1 RGB 硬拼）、`telestyle_a1_rgb_hardcut_north_chart.png` 和 `telestyle_a1_rgb_hardcut_south_chart.png`。另外写出 `telestyle_a1_rgb_hardcut_report.json`，不再生成 comparison 拼图。南北 chart 是去噪后分别解码的 1024×1024 方形图。A1 最终图不再合成 ERP latent，而是把两张 decoded RGB chart 以 2 倍分辨率球面重投影到 ERP，在赤道硬拼后使用 area 抗锯齿缩小。报告中的左右接缝误差与像素差只能辅助比较，风格强度、极区纹理和结构稳定性仍需查看原尺寸 ERP。
+
+A1 训练时没有加载 TeleStyle/Lightning LoRA，因此这一组合属于实验性推理。checkpoint 中的 chart size 必须与 `--hemisphere-size` 一致；不传任何 A1 参数时，原有生图路径不变。
+
+训练期间的进度条按累计缓存样本计数，并显示当前 step、阶段、loss、gate 和预计剩余时间；样本会跨 epoch 重复抽取，该计数不是去重图片数。
+
+训练入口会在加载大模型前检查 CUDA、显存档位、模型文件、缓存清单和可用空间。检查点只包含 SphereAdapter、EMA、注入 gates、优化器状态及基础模型哈希，不会合并或写回基础 Qwen 模型。

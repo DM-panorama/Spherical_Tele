@@ -1,0 +1,60 @@
+stage: A1
+seed: 1234
+
+paths:
+  model_dir: /root/autodl-tmp/Qwen-Image-Edit-2509
+  dataset_root: data/a1/erp/Structured3D
+  manifest_root: data/a1/manifests
+  cache_root: data/a1/cache
+  stress_root: data/a1/stress
+  output_root: outputs/a1
+
+data:
+  min_erp_height: 512
+  split_percentages: [90, 5, 5]
+  extensions: [.png, .jpg, .jpeg, .webp, .tif, .tiff]
+  overlap_degrees_range: [12.0, 18.0]
+  consistency_degrees: 10.0
+  seam_error_warn_threshold: 0.12
+  stress_fraction_highfreq: 0.25
+
+model:
+  hidden_dim: 3072
+  adapter_dim: 512
+  num_heads: 8
+  global_tokens: 32
+  equator_tokens: 256
+  correspondence_neighbors: 4
+  injection_stride: 4
+  zero_init: true
+
+training:
+  total_steps: 20000
+  warmup_end: 2000
+  geometry_end: 12000
+  lr_warmup_steps: 500
+  validation_steps: 500
+  save_steps: 500
+  keep_last: 3
+  gradient_clip: 1.0
+  weight_decay: 0.01
+  lr_position_tokens: 1.0e-4
+  lr_cross_modules: 5.0e-5
+  lr_gates: 1.0e-5
+  ema_decay: 0.999
+  decode_loss_probability: [0.10, 0.25, 0.50]
+  prompt: Reconstruct the panorama content while preserving its spherical geometry.
+  dtype: bfloat16
+  decode_chart_size: 512
+
+loss:
+  warmup: {diffusion: 1.0, rgb: 0.02, gradient: 0.0, laplacian: 0.0, seam: 0.0, energy: 0.0, symmetry: 0.0}
+  geometry: {diffusion: 1.0, rgb: 0.05, gradient: 0.05, laplacian: 0.0, seam: 0.02, energy: 0.0, symmetry: 0.01}
+  highfreq: {diffusion: 1.0, rgb: 0.03, gradient: 0.08, laplacian: 0.08, seam: 0.08, energy: 0.02, symmetry: 0.01}
+
+runtime:
+  minimum_training_vram_gb: 24
+  chart_profiles:
+    - {minimum_vram_gb: 80, chart_size: 1024, gradient_accumulation: 8, cpu_offload: false}
+    - {minimum_vram_gb: 48, chart_size: 768, gradient_accumulation: 8, cpu_offload: true}
+    - {minimum_vram_gb: 24, chart_size: 512, gradient_accumulation: 16, cpu_offload: true}

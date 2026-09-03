@@ -7,6 +7,7 @@ available as an explicit legacy mode.
 """
 
 import argparse
+import json
 import os
 from pathlib import Path
 from typing import Tuple
@@ -208,9 +209,16 @@ def stylize_panorama(
     hemisphere_size: int | None = None,
     hemisphere_overlap_degrees: float = 15.0,
     decode_padding_px: int = 128,
-) -> tuple[Image.Image, int, Tuple[int, int]]:
+    use_sphere_adapter: bool = False,
+    rgb_hard_cut_without_a1: bool = False,
+    return_chart_images: bool = False,
+):
     """Stylize an ERP with synchronized hemisphere charts or the legacy path."""
+    if use_sphere_adapter and rgb_hard_cut_without_a1:
+        raise ValueError("A1 and no-A1 RGB hard-cut modes are mutually exclusive.")
     if panorama_mode == "legacy":
+        if return_chart_images or rgb_hard_cut_without_a1:
+            raise ValueError("chart image output requires A1 hemisphere inference.")
         return _stylize_panorama_legacy(
             engine, content, style, prompt, seed, steps, margin_px, blend_px,
             enable_polar_fusion, polar_rotation_degrees,
@@ -249,6 +257,9 @@ def stylize_panorama(
         _nearest_multiple_of_16(source_size[1]),
     )
     decode_padding = _effective_decode_padding(target_size, decode_padding_px)
+    effective_decode_padding = (
+        0 if use_sphere_adapter or rgb_hard_cut_without_a1 else decode_padding
+    )
     content_north = extract_stereographic_hemisphere(
         content, chart_size, hemisphere_overlap_degrees, north=True
     )
@@ -258,14 +269,100 @@ def stylize_panorama(
     working_style = style.convert("RGB").resize(
         (1024, 1024), Image.Resampling.LANCZOS
     )
-    generated = engine.inference_with_hemisphere_latent_sync(
-        prompt, content_north, content_south, working_style, seed, steps,
-        target_size[1], target_size[0], hemisphere_overlap_degrees,
-        decode_padding // 8,
-    )
+    if return_chart_images and not use_sphere_adapter:
+        raise ValueError("chart image output requires an enabled A1 adapter.")
+    if return_chart_images:
+        generated, north_image, south_image = (
+            engine.inference_with_hemisphere_sphere_adapter(
+                prompt, content_north, content_south, working_style, seed, steps,
+                target_size[1], target_size[0], hemisphere_overlap_degrees,
+                effective_decode_padding // 8, return_chart_images=True,
+            )
+        )
+    elif rgb_hard_cut_without_a1:
+        generated = engine.inference_with_hemisphere_rgb_hard_cut(
+            prompt, content_north, content_south, working_style, seed, steps,
+            target_size[1], target_size[0], hemisphere_overlap_degrees,
+        )
+    elif use_sphere_adapter:
+        generated = engine.inference_with_hemisphere_sphere_adapter(
+            prompt, content_north, content_south, working_style, seed, steps,
+            target_size[1], target_size[0], hemisphere_overlap_degrees,
+            effective_decode_padding // 8,
+        )
+    else:
+        generated = engine.inference_with_hemisphere_latent_sync(
+            prompt, content_north, content_south, working_style, seed, steps,
+            target_size[1], target_size[0], hemisphere_overlap_degrees,
+            effective_decode_padding // 8,
+        )
     if generated.size != source_size:
         generated = generated.resize(source_size, Image.Resampling.LANCZOS)
-    return generated, decode_padding, (chart_size, chart_size)
+    if return_chart_images:
+        return (
+            generated, effective_decode_padding, (chart_size, chart_size),
+            north_image, south_image,
+        )
+    return generated, effective_decode_padding, (chart_size, chart_size)
+
+
+def _a1_ab_output_paths(output_path: Path) -> tuple[Path, Path, Path]:
+    """Derive baseline, no-A1 hard-cut, and report paths."""
+    suffix = output_path.suffix
+    a1_suffix = "_a1_rgb_hardcut"
+    if output_path.stem.endswith(a1_suffix):
+        root = output_path.stem[:-len(a1_suffix)]
+        no_a1_stem = f"{root}_no_a1_rgb_hardcut"
+    else:
+        no_a1_stem = f"{output_path.stem}_no_a1_rgb_hardcut"
+    return (
+        output_path.with_name(f"{output_path.stem}_baseline{suffix}"),
+        output_path.with_name(f"{no_a1_stem}{suffix}"),
+        output_path.with_name(f"{output_path.stem}_report.json"),
+    )
+
+
+def _a1_chart_output_paths(output_path: Path) -> tuple[Path, Path]:
+    """Derive native north/south chart image paths from the A1 output."""
+    suffix = output_path.suffix
+    return (
+        output_path.with_name(f"{output_path.stem}_north_chart{suffix}"),
+        output_path.with_name(f"{output_path.stem}_south_chart{suffix}"),
+    )
+
+
+def _rgb_comparison_metrics(
+    first: Image.Image, second: Image.Image,
+    first_label: str = "baseline", second_label: str = "a1",
+) -> dict[str, float]:
+    """Return simple normalized pixel-change and ERP seam diagnostics."""
+    first_array = np.asarray(first.convert("RGB"), dtype=np.float32) / 255.0
+    second_array = np.asarray(second.convert("RGB"), dtype=np.float32) / 255.0
+    if first_array.shape != second_array.shape:
+        raise ValueError("A1 comparison images must have identical sizes.")
+
+    def seam_l1(array: np.ndarray) -> float:
+        return float(np.abs(array[:, 0] - array[:, -1]).mean())
+
+    difference = np.abs(second_array - first_array)
+    return {
+        "pixel_mae": float(difference.mean()),
+        "pixel_max_difference": float(difference.max()),
+        f"{first_label}_left_right_seam_l1": seam_l1(first_array),
+        f"{second_label}_left_right_seam_l1": seam_l1(second_array),
+    }
+
+
+def _validate_a1_args(args: argparse.Namespace) -> None:
+    """Validate optional A1 CLI combinations before loading large models."""
+    if args.a1_ab_test and not args.a1_checkpoint:
+        raise ValueError("--a1-ab-test requires --a1-checkpoint.")
+    if getattr(args, "save_a1_chart_images", False) and not args.a1_checkpoint:
+        raise ValueError(
+            "--save-a1-chart-images requires --a1-checkpoint."
+        )
+    if args.a1_checkpoint and args.panorama_mode != "hemisphere":
+        raise ValueError("A1 inference requires --panorama-mode hemisphere.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -290,7 +387,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--decode-padding-px", type=int, default=128,
-        help="Spherical padding used only for the final ERP VAE decode",
+        help="Spherical padding for baseline ERP decode; unused by A1 RGB hard-cut",
     )
     parser.add_argument("--margin-px", type=int, default=256, help="Circular extension width")
     parser.add_argument("--blend-px", type=int, default=96, help="Latent seam synchronization width")
@@ -306,11 +403,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--polar-detail-end-degrees", type=float, default=88.0, help="Latitude where final A detail limiting reaches full weight")
     parser.add_argument("--polar-detail-radius-latent", type=int, default=24, help="Maximum final A polar low-pass radius in latent pixels")
     parser.add_argument("--polar-detail-steps", type=int, default=2, help="Number of final A denoising steps to limit polar detail")
+    parser.add_argument(
+        "--a1-config", default="configs/a1.yaml",
+        help="SphereAdapter config used to construct the A1 inference module",
+    )
+    parser.add_argument(
+        "--a1-checkpoint",
+        help="Optional A1 SphereAdapter checkpoint; hemisphere mode only",
+    )
+    parser.add_argument(
+        "--a1-ab-test", action="store_true",
+        help="Generate five diagnostic images and one JSON report",
+    )
+    parser.add_argument(
+        "--save-a1-chart-images", action="store_true",
+        help="Decode and save north/south A1 latents before ERP composition",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    _validate_a1_args(args)
     for path, label in ((args.content, "content"), (args.style, "style")):
         if not os.path.isfile(path):
             raise FileNotFoundError(f"{label} image does not exist: {path}")
@@ -321,36 +435,130 @@ def main() -> None:
         style = image.convert("RGB")
 
     engine = ImageStyleInference()
-    with torch.no_grad():
-        result, margin, working_size = stylize_panorama(
-            engine=engine, content=content, style=style, prompt=args.prompt,
-            seed=args.seed, steps=args.steps, margin_px=args.margin_px,
-            blend_px=args.blend_px,
-            enable_polar_fusion=args.enable_polar_fusion,
-            polar_rotation_degrees=args.polar_rotation_degrees,
-            polar_blend_start_degrees=args.polar_blend_start_degrees,
-            polar_blend_end_degrees=args.polar_blend_end_degrees,
-            polar_fusion_steps=args.polar_fusion_steps,
-            polar_fusion_strength=args.polar_fusion_strength,
-            polar_lowpass_radius_latent=args.polar_lowpass_radius_latent,
-            polar_detail_limiter=args.polar_detail_limiter,
-            polar_detail_start_degrees=args.polar_detail_start_degrees,
-            polar_detail_end_degrees=args.polar_detail_end_degrees,
-            polar_detail_radius_latent=args.polar_detail_radius_latent,
-            polar_detail_steps=args.polar_detail_steps,
-            panorama_mode=args.panorama_mode,
-            hemisphere_size=args.hemisphere_size,
-            hemisphere_overlap_degrees=args.hemisphere_overlap_degrees,
-            decode_padding_px=args.decode_padding_px,
+    checkpoint_info = None
+    if args.a1_checkpoint:
+        expected_chart_size = (
+            args.hemisphere_size
+            if args.hemisphere_size is not None
+            else _nearest_multiple_of_16(content.height)
         )
+        checkpoint_info = engine.load_sphere_adapter(
+            args.a1_config, args.a1_checkpoint, expected_chart_size
+        )
+        print(
+            "Loaded experimental TeleStyle + A1 combination: "
+            f"step={checkpoint_info['step']}, chart={expected_chart_size}."
+        )
+
+    stylize_kwargs = {
+        "engine": engine,
+        "content": content,
+        "style": style,
+        "prompt": args.prompt,
+        "seed": args.seed,
+        "steps": args.steps,
+        "margin_px": args.margin_px,
+        "blend_px": args.blend_px,
+        "enable_polar_fusion": args.enable_polar_fusion,
+        "polar_rotation_degrees": args.polar_rotation_degrees,
+        "polar_blend_start_degrees": args.polar_blend_start_degrees,
+        "polar_blend_end_degrees": args.polar_blend_end_degrees,
+        "polar_fusion_steps": args.polar_fusion_steps,
+        "polar_fusion_strength": args.polar_fusion_strength,
+        "polar_lowpass_radius_latent": args.polar_lowpass_radius_latent,
+        "polar_detail_limiter": args.polar_detail_limiter,
+        "polar_detail_start_degrees": args.polar_detail_start_degrees,
+        "polar_detail_end_degrees": args.polar_detail_end_degrees,
+        "polar_detail_radius_latent": args.polar_detail_radius_latent,
+        "polar_detail_steps": args.polar_detail_steps,
+        "panorama_mode": args.panorama_mode,
+        "hemisphere_size": args.hemisphere_size,
+        "hemisphere_overlap_degrees": args.hemisphere_overlap_degrees,
+        "decode_padding_px": args.decode_padding_px,
+    }
+
+    baseline = None
+    no_a1_rgb_hard_cut = None
+    save_chart_images = args.save_a1_chart_images or args.a1_ab_test
+    with torch.no_grad():
+        if args.a1_ab_test:
+            baseline, _, _ = stylize_panorama(
+                **stylize_kwargs, use_sphere_adapter=False
+            )
+            no_a1_rgb_hard_cut, _, _ = stylize_panorama(
+                **stylize_kwargs, rgb_hard_cut_without_a1=True
+            )
+        result_payload = stylize_panorama(
+            **stylize_kwargs,
+            use_sphere_adapter=bool(args.a1_checkpoint),
+            return_chart_images=save_chart_images,
+        )
+        if save_chart_images:
+            result, margin, working_size, north_image, south_image = result_payload
+        else:
+            result, margin, working_size = result_payload
+            north_image = None
+            south_image = None
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result.save(output_path)
+    extra_outputs = []
+    chart_paths = None
+    if north_image is not None and south_image is not None:
+        chart_paths = _a1_chart_output_paths(output_path)
+        north_image.save(chart_paths[0])
+        south_image.save(chart_paths[1])
+        extra_outputs.extend(chart_paths)
+    if baseline is not None and no_a1_rgb_hard_cut is not None:
+        baseline_path, no_a1_path, report_path = _a1_ab_output_paths(
+            output_path
+        )
+        baseline.save(baseline_path)
+        no_a1_rgb_hard_cut.save(no_a1_path)
+        report = {
+            "experimental_combination": True,
+            "content": str(Path(args.content).resolve()),
+            "style": str(Path(args.style).resolve()),
+            "prompt": args.prompt,
+            "seed": args.seed,
+            "steps": args.steps,
+            "hemisphere_size": working_size[0],
+            "hemisphere_overlap_degrees": args.hemisphere_overlap_degrees,
+            "a1_composition": "decoded_rgb_hard_cut",
+            "no_a1_composition": "independent_decoded_rgb_hard_cut",
+            "rgb_hard_cut_antialias_scale": 2,
+            "south_rgb_yaw_degrees": 0.0,
+            "a1_config": str(Path(args.a1_config).resolve()),
+            "a1_checkpoint": checkpoint_info,
+            "outputs": {
+                "baseline": str(baseline_path.resolve()),
+                "no_a1_rgb_hard_cut": str(no_a1_path.resolve()),
+                "a1_rgb_hard_cut": str(output_path.resolve()),
+                "north_chart": str(chart_paths[0].resolve()),
+                "south_chart": str(chart_paths[1].resolve()),
+            },
+            "metrics": {
+                "baseline_vs_a1": _rgb_comparison_metrics(
+                    baseline, result
+                ),
+                "no_a1_rgb_hard_cut_vs_a1": _rgb_comparison_metrics(
+                    no_a1_rgb_hard_cut, result,
+                    first_label="no_a1_rgb_hard_cut",
+                    second_label="a1",
+                ),
+            },
+        }
+        report_path.write_text(
+            json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        extra_outputs.extend([baseline_path, no_a1_path, report_path])
+
     if args.panorama_mode == "hemisphere":
         mode_details = (
             f"chart={working_size} | overlap={args.hemisphere_overlap_degrees}deg | "
-            f"decode_padding={margin}px"
+            f"decode_padding={margin}px | a1={bool(args.a1_checkpoint)}"
         )
     else:
         mode_details = (
@@ -361,6 +569,8 @@ def main() -> None:
         f"Saved {output_path} | input={content.size} | "
         f"mode={args.panorama_mode} | {mode_details}"
     )
+    if extra_outputs:
+        print("Saved extra artifacts: " + ", ".join(map(str, extra_outputs)))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,66 @@
+stage: A1
+seed: 1234
+
+paths:
+  model_dir: /root/autodl-tmp/Qwen-Image-Edit-2509
+  dataset_root: data/a1/erp/Structured3D
+  manifest_root: data/a1/manifests
+  cache_root: data/a1/cache
+  stress_root: data/a1/stress
+  output_root: outputs/a1_telestyle_pilot
+  style_root: data/a1/style
+  style_cache_root: data/a1/style_cache
+
+data:
+  min_erp_height: 512
+  split_percentages: [90, 5, 5]
+  extensions: [.png, .jpg, .jpeg, .webp, .tif, .tiff]
+  overlap_degrees_range: [12.0, 18.0]
+  consistency_degrees: 10.0
+  seam_error_warn_threshold: 0.12
+  stress_fraction_highfreq: 0.25
+
+model:
+  hidden_dim: 3072
+  adapter_dim: 512
+  num_heads: 8
+  global_tokens: 32
+  equator_tokens: 256
+  correspondence_neighbors: 4
+  injection_stride: 4
+  zero_init: true
+  lora_paths:
+    - weights/diffsynth_Qwen-Image-Edit-2509-telestyle.safetensors
+    - weights/diffsynth_Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors
+
+training:
+  total_steps: 60
+  warmup_end: 10
+  geometry_end: 40
+  lr_warmup_steps: 10
+  validation_steps: 20
+  save_steps: 20
+  keep_last: 3
+  gradient_clip: 1.0
+  weight_decay: 0.01
+  lr_position_tokens: 5.0e-5
+  lr_cross_modules: 2.0e-5
+  lr_gates: 1.0e-4
+  ema_decay: 0.99
+  decode_loss_probability: [0.0, 0.10, 0.20]
+  prompt: Style Transfer the style of Figure 2 to Figure 1, and keep the content and characteristics of Figure 1.
+  dtype: bfloat16
+  decode_chart_size: 512
+  style_size: 1024
+  south_yaw_degrees: 180.0
+  gate_l2: 1.0e-4
+
+loss:
+  warmup: {teacher: 1.0, rgb: 0.02, gradient: 0.0, laplacian: 0.0, seam: 0.0, energy: 0.0}
+  geometry: {teacher: 1.0, rgb: 0.05, gradient: 0.05, laplacian: 0.0, seam: 0.02, energy: 0.0}
+  highfreq: {teacher: 1.0, rgb: 0.03, gradient: 0.08, laplacian: 0.08, seam: 0.08, energy: 0.02}
+
+runtime:
+  minimum_training_vram_gb: 80
+  chart_profiles:
+    - {minimum_vram_gb: 80, chart_size: 1024, gradient_accumulation: 4, cpu_offload: false}

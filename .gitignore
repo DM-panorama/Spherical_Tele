@@ -1,3 +1,14 @@
 weights/
 qwen_style_output/
 __pycache__/
+.pytest_cache/
+
+# Ignore all local data except its tracked documentation.
+data/*
+!data/a1/
+data/a1/*
+!data/a1/README.md
+# Generated outputs and checkpoints are local-only.
+outputs/
+
+.ipynb_checkpoints/
