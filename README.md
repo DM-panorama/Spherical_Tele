@@ -57,7 +57,7 @@ weights/
 
 1. **读取并对齐尺寸**：内容图和风格图转换为 RGB；ERP 目标宽高对齐到 16 的倍数。
 2. **建立南北 chart**：以南极、北极为中心生成两个方形立体投影 chart。chart 的球面覆盖角为 `90° + overlap`，默认覆盖到对方半球 `15°`。
-3. **准备两份推理状态**：北、南 chart 分别建立 edit condition、scheduler 和 latent 轨迹；北分支使用 `seed`，南分支使用 `seed + 1`。
+3. **准备两份推理状态**：北、南 chart 分别建立 edit condition、scheduler 和 latent 轨迹；南北分支使用相同的 `seed`。
 4. **同步初始 latent**：通过球面方向映射，把两个 chart 的共同赤道带重投影到彼此坐标系，并按纬度置信权重融合。
 5. **逐步去噪并同步**：每个 scheduler step 中，两条分支分别预测并更新自己的 latent；更新后只同步双方共同的赤道带，不把一条分支的整份 latent 覆盖给另一条分支。
 6. **合成 ERP latent**：去噪结束后，把南北 chart 按 ERP 像素中心和单位球坐标重投影为一张 ERP latent，并在重叠纬度带平滑融合。
@@ -102,7 +102,7 @@ python telestylepanorama_inference.py \
 | `--style` | 必填 | 风格参考图路径 |
 | `--output` | 必填 | 输出路径，父目录不存在时自动创建 |
 | `--prompt` | 内置 ERP 提示词 | 编辑指令 |
-| `--seed` | `123` | 北分支随机种子；南分支使用该值加 1 |
+| `--seed` | `123` | 南北分支共用的随机种子 |
 | `--steps` | `4` | 去噪步数，必须大于 0 |
 | `--panorama-mode` | `hemisphere` | 全景图方法，可选 `hemisphere` 或 `legacy` |
 | `--hemisphere-size` | 输入 ERP 高度对齐到 16 | 单个方形 chart 的边长；显式设置时必须为正且能被 16 整除 |
@@ -257,7 +257,7 @@ python telestylepanorama_inference.py \
     --save-a1-chart-images
 ```
 
-A/B 模式一次生成五张图片：`telestyle_a1_rgb_hardcut_baseline.png`（原版 latent 合成 baseline）、`telestyle_no_a1_rgb_hardcut.png`（无 A1 的独立双半球 RGB 硬拼）、`telestyle_a1_rgb_hardcut.png`（A1 RGB 硬拼）、`telestyle_a1_rgb_hardcut_north_chart.png` 和 `telestyle_a1_rgb_hardcut_south_chart.png`。另外写出 `telestyle_a1_rgb_hardcut_report.json`，不再生成 comparison 拼图。南北 chart 是去噪后分别解码的 1024×1024 方形图。A1 最终图不再合成 ERP latent，而是把两张 decoded RGB chart 以 2 倍分辨率球面重投影到 ERP，在赤道硬拼后使用 area 抗锯齿缩小。报告中的左右接缝误差与像素差只能辅助比较，风格强度、极区纹理和结构稳定性仍需查看原尺寸 ERP。
+A/B 模式一次生成五张图片：`telestyle_a1_rgb_hardcut_baseline.png`（原版 latent 合成 baseline）、`telestyle_no_a1_rgb_hardcut.png`（无 A1 的独立双半球 RGB 硬拼）、`telestyle_a1_rgb_hardcut.png`（A1 RGB 硬拼）、`telestyle_a1_rgb_hardcut_north_chart.png` 和 `telestyle_a1_rgb_hardcut_south_chart.png`。另外写出 `telestyle_a1_rgb_hardcut_report.json`，不再生成 comparison 拼图。南北 chart 是去噪后分别解码的 1024×1024 方形图。A1 最终图不再合成 ERP latent，而是把两张 decoded RGB chart 按原生球面坐标以 2 倍分辨率重投影到 ERP，在赤道硬拼后使用 area 抗锯齿缩小。最终 ERP 不对南半球额外施加 yaw；单独保存的 south chart 会旋转 180°，以便与 north chart 按相同观察方向比较。报告中的左右接缝误差与像素差只能辅助比较，风格强度、极区纹理和结构稳定性仍需查看原尺寸 ERP。
 
 A1 训练时没有加载 TeleStyle/Lightning LoRA，因此这一组合属于实验性推理。checkpoint 中的 chart size 必须与 `--hemisphere-size` 一致；不传任何 A1 参数时，原有生图路径不变。
 

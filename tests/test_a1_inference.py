@@ -220,8 +220,10 @@ class _FakeA1Pipe:
         self.device = torch.device("cpu")
         self.model_fn = object()
         self.model_calls = 0
+        self.seeds = []
 
     def unit_runner(self, unit, pipe, inputs, posi, nega):
+        self.seeds.append(inputs["seed"])
         latent = torch.zeros(
             1, 2, inputs["height"] // 8, inputs["width"] // 8
         )
@@ -245,7 +247,9 @@ class _FakeA1Pipe:
         return inputs["latents"]
 
     def vae_output_to_image(self, tensor):
-        return Image.new("RGB", (tensor.shape[-1], tensor.shape[-2]))
+        image = Image.new("RGB", (tensor.shape[-1], tensor.shape[-2]))
+        image.putpixel((0, 0), (255, 0, 0))
+        return image
 
 
 class _FakeSphereModel:
@@ -264,6 +268,7 @@ class A1RgbHardCutTests(unittest.TestCase):
         )
 
         self.assertEqual(engine.pipe.model_calls, 4)
+        self.assertEqual(engine.pipe.seeds, [123, 123])
         self.assertEqual(engine.pipe.vae.decode_calls, 2)
         self.assertEqual(result.size, (32, 16))
 
@@ -284,9 +289,13 @@ class A1RgbHardCutTests(unittest.TestCase):
         )
 
         self.assertEqual(engine.pipe.vae.decode_calls, 2)
+        self.assertEqual(engine.pipe.seeds, [123, 123])
         self.assertEqual(result.size, (32, 16))
         self.assertEqual(north.size, (32, 32))
         self.assertEqual(south.size, (32, 32))
+        self.assertEqual(north.getpixel((0, 0)), (255, 0, 0))
+        self.assertEqual(south.getpixel((31, 31)), (255, 0, 0))
+        self.assertEqual(south.getpixel((0, 0)), (0, 0, 0))
 
 
 class A1PanoramaRoutingTests(unittest.TestCase):

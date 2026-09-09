@@ -16,7 +16,11 @@ import numpy as np
 import torch
 from PIL import Image
 
-from telestyleimage_inference import ImageStyleInference
+from telestyleimage_inference import (
+    ImageStyleInference,
+    RGB_HARD_CUT_SOUTH_YAW_DEGREES,
+    SOUTH_CHART_DISPLAY_ROTATION_DEGREES,
+)
 from telestyle_spherical import (
     extract_stereographic_hemisphere,
     rotate_erp_image,
@@ -528,7 +532,10 @@ def main() -> None:
             "a1_composition": "decoded_rgb_hard_cut",
             "no_a1_composition": "independent_decoded_rgb_hard_cut",
             "rgb_hard_cut_antialias_scale": 2,
-            "south_rgb_yaw_degrees": 0.0,
+            "south_rgb_yaw_degrees": RGB_HARD_CUT_SOUTH_YAW_DEGREES,
+            "south_chart_display_rotation_degrees": (
+                SOUTH_CHART_DISPLAY_ROTATION_DEGREES
+            ),
             "a1_config": str(Path(args.a1_config).resolve()),
             "a1_checkpoint": checkpoint_info,
             "outputs": {

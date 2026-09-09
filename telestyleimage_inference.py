@@ -19,6 +19,10 @@ from telestyle_spherical import (
 )
 
 
+RGB_HARD_CUT_SOUTH_YAW_DEGREES = 0.0
+SOUTH_CHART_DISPLAY_ROTATION_DEGREES = 180
+
+
 def synchronize_wrapped_latents(latents, centre_x, centre_width, blend_width):
     """Synchronize duplicate ERP edge strips in-place in VAE latent space."""
     if blend_width == 0:
@@ -499,7 +503,7 @@ class ImageStyleInference:
             pipe, prompt, content_north, style, seed, num_inference_steps
         )
         inputs_south, posi_south, nega_south = _prepare_edit_inputs(
-            pipe, prompt, content_south, style, seed + 1, num_inference_steps
+            pipe, prompt, content_south, style, seed, num_inference_steps
         )
         if inputs_north["latents"].shape != inputs_south["latents"].shape:
             raise ValueError("hemisphere latent charts must have identical shapes.")
@@ -610,7 +614,7 @@ class ImageStyleInference:
             pipe, prompt, content_north, style, seed, num_inference_steps
         )
         inputs_south, posi_south, nega_south = _prepare_edit_inputs(
-            pipe, prompt, content_south, style, seed + 1, num_inference_steps
+            pipe, prompt, content_south, style, seed, num_inference_steps
         )
         if inputs_north["latents"].shape != inputs_south["latents"].shape:
             raise ValueError("hemisphere latent charts must have identical shapes.")
@@ -666,8 +670,8 @@ class ImageStyleInference:
             north_decoded, south_decoded, overlap_degrees,
             consistency_degrees, output_height, output_width,
             antialias_scale=2,
-            # Both charts use the same ERP longitude convention.
-            south_yaw_degrees=0.0,
+            # Keep the native chart longitude convention for final ERP composition.
+            south_yaw_degrees=RGB_HARD_CUT_SOUTH_YAW_DEGREES,
         )
         image = pipe.vae_output_to_image(projected.hard_cut)
         del north_decoded, south_decoded, projected
@@ -736,7 +740,7 @@ class ImageStyleInference:
             pipe, prompt, content_north, style, seed, num_inference_steps
         )
         inputs_south, posi_south, _ = _prepare_edit_inputs(
-            pipe, prompt, content_south, style, seed + 1, num_inference_steps
+            pipe, prompt, content_south, style, seed, num_inference_steps
         )
         if inputs_north["latents"].shape != inputs_south["latents"].shape:
             raise ValueError("hemisphere latent charts must have identical shapes.")
@@ -808,15 +812,17 @@ class ImageStyleInference:
             output_height,
             output_width,
             antialias_scale=2,
-            # Keep extraction and reprojection longitude conventions inverse.
-            south_yaw_degrees=0.0,
+            # Keep the native chart longitude convention for final ERP composition.
+            south_yaw_degrees=RGB_HARD_CUT_SOUTH_YAW_DEGREES,
         )
         image = pipe.vae_output_to_image(projected.hard_cut)
         north_image = None
         south_image = None
         if return_chart_images:
             north_image = pipe.vae_output_to_image(north_decoded)
-            south_image = pipe.vae_output_to_image(south_decoded)
+            south_image = pipe.vae_output_to_image(south_decoded).rotate(
+                SOUTH_CHART_DISPLAY_ROTATION_DEGREES
+            )
         del north_decoded, south_decoded, projected
         pipe.load_models_to_device([])
         if return_chart_images:
