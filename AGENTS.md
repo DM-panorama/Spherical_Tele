@@ -1,42 +1,49 @@
 # AGENTS.md
 
-## 适用范围
+## 仓库概况
 
-本仓库包含 TeleStyle 图像、全景图和视频风格迁移的推理代码。它主要是研究与推理仓库：没有包构建系统，也没有完整的自动化测试套件。
+TeleStyle 是基于 Qwen Image Edit 的图像与 ERP 全景风格迁移研究仓库，同时包含 A1 SphereAdapter 的数据准备、训练、评估和推理代码。完整推理与训练依赖 Python 3.11、CUDA、大模型权重及 `requirements.txt` 中固定版本的依赖。
 
-## 仓库导航
+## 主要文件
 
-- `telestyleimage_inference.py`：Qwen Image Edit 与 TeleStyle 图像 LoRA。其 `__main__` 块是一个硬编码的小型示例。
-- `telestylepanorama_inference.py`：接缝感知 ERP 全景图命令行流程，导入图像脚本中的 `ImageStyleInference`。
-- `telestyle_spherical.py`：无模型依赖的 ERP 球面重投影、X 轴旋转与纬度融合工具。
-- `inputs/` 与 `assets/`：已跟踪的示例和文档素材。
-- `weights/`、模型缓存与生成结果目录：本地运行数据；不要将大型产物提交到 Git。
+- `telestyleimage_inference.py`：图像推理，以及全景流程共用的 `ImageStyleInference`。
+- `telestylepanorama_inference.py`：全景 CLI；默认 `hemisphere`，另有 `legacy` 环形画布模式和可选 A1 checkpoint。
+- `telestyle_spherical.py`：ERP 旋转、stereographic chart、球面重投影和 latent 融合纯函数。
+- `training/`：A1 数据缓存、几何、损失、SphereAdapter、Qwen 封装、训练与评估。
+- `configs/`：A1 基础、pilot 和 TeleStyle pilot 配置。
+- `tests/`：CPU 单元测试与轻量 fake-model 推理测试。
+- `inputs/`：示例输入。权重、模型缓存和生成结果均为本地数据，不要提交。
 
-## 环境与权重
+## 修改约束
 
-- 目标环境为 Python 3.11 和支持 CUDA 的 PyTorch。图像与全景图推理依赖 CUDA 和大模型权重，不应预期它们能在仅 CPU 的 CI 环境中完整运行。
-- 使用 `pip install -r requirements.txt` 安装依赖；DiffSynth 依赖固定到一个 Git commit。
-- 图像推理的基础模型路径目前在 `ImageStyleInference._load_models()` 中与机器路径绑定。除非任务明确要求路径可配置化，否则保持该行为；任何路径变更都要同步更新 `README.md`。
-- 权重文件名及预期目录结构需与 README 保持一致。除非明确要求，绝不提交权重、模型缓存或生成媒体文件。
-
-## 修改规范
-
-- 保持修改聚焦。除非任务涉及接口调整，否则保留现有公开 CLI 参数名称和默认值。
-- 图像尺寸必须符合 DiT/VAE 对齐规则。全景脚本采用 16 像素图像对齐，并在接缝同步前将坐标转换至 latent 空间。
-- 修改全景逻辑时，必须保持环形顺序：`[右边缘 | 中心全景 | 左边缘]`，并在调用模型前校验宽度、边距和融合范围。
-- 球面重投影必须通过 ERP 像素中心、单位球坐标和重采样完成；禁止用 `torch.rot90` 替代球面旋转。双分支模式中 A/B 保留独立 scheduler 和 latent 轨迹，只在最后若干步将对齐后的 B 去噪预测融合进 A；不要在每一步将 A latent 回写给 B。仅解码最终 A 分支。
-- 验证小型纯函数时，避免导入或初始化重量级模型代码；尽可能使辅助函数保持确定性。
-- 代码标识符、docstring、CLI 帮助信息使用英文；README 和 AGENTS 文档使用中文。除非在澄清被修改代码，否则可以保留已有中文注释。
+- 修改保持聚焦；除非任务明确要求，否则保留现有 CLI 参数、默认值、权重名称和硬编码基础模型路径。路径变化需同步更新 `README.md`。
+- 图像尺寸遵守 DiT/VAE 对齐规则；全景输入和 chart 尺寸按 16 像素对齐。
+- `legacy` 环形画布顺序必须保持为 `[右边缘 | 中心全景 | 左边缘]`。
+- 球面变换必须基于 ERP 像素中心、单位球方向和重采样；不得用 `torch.rot90` 代替球面旋转。
+- 双分支推理保留各自 scheduler 和 latent 轨迹；不要无意中把一个分支 latent 逐步覆盖到另一个分支。
+- 纯几何辅助函数应确定、可在 CPU 测试，测试中避免初始化重量级模型。
+- 代码标识符、docstring 和 CLI help 使用英文；README、AGENTS 和设计文档使用中文。
 
 ## 验证
 
-修改后运行最轻量且相关的检查：
+只运行与改动相关的最小检查。基础语法检查：
 
 ```bash
-python -m py_compile telestyleimage_inference.py telestylepanorama_inference.py telestyle_spherical.py
-python -m unittest tests/test_spherical_reprojection.py
+python -m py_compile telestyleimage_inference.py telestylepanorama_inference.py telestyle_spherical.py training/*.py
 ```
 
-只改文档时，核对 Markdown 链接、命令、权重名称和路径是否与当前源码一致。修改全景辅助逻辑时，添加或运行 CPU 测试，确认环形画布顺序、球面映射、极区权重和输出尺寸。除非任务范围、权重和 GPU 显存均合适，否则不要运行完整模型推理。
+球面或全景几何改动至少运行：
 
-交付前检查 `git diff --check` 与 `git status --short`。不要还原或覆盖预先存在的用户修改。
+```bash
+python -m unittest tests/test_spherical_reprojection.py tests/test_a1_geometry_losses.py
+```
+
+A1 或共享推理逻辑改动按需运行对应 `tests/test_a1_*.py`、`tests/test_sphere_adapter.py` 和 `tests/test_telestyle_pilot.py`。当前维护中的 CPU 回归集合为：
+
+```bash
+python -m unittest tests/test_spherical_reprojection.py tests/test_a1_geometry_losses.py tests/test_sphere_adapter.py tests/test_a1_data.py tests/test_a1_training_dtype.py tests/test_a1_training_loop.py tests/test_a1_inference.py tests/test_a1_comparison.py tests/test_telestyle_pilot.py
+```
+
+`tests/test_atlas_inference.py` 与 `tests/test_hemisphere_rgb_inference.py` 仍引用已移除或改名的接口，修复前不属于通过基线。除非权重、GPU 和任务范围都合适，否则不要运行完整模型推理。
+
+只改文档时核对链接、命令和源码名称即可。交付前运行 `git diff --check` 和 `git status --short`，不要覆盖已有用户修改。
