@@ -51,7 +51,10 @@ def synchronize_wrapped_latents(latents, centre_x, centre_width, blend_width):
     return latents
 
 
-def _prepare_edit_inputs(pipe, prompt, content, style, seed, num_inference_steps):
+def _prepare_edit_inputs(
+    pipe, prompt, content, style, seed, num_inference_steps,
+    spherical_padding_px=None,
+):
     """Run pipeline units and return one independent edit-inference state."""
     height, width = content.height, content.width
     inputs_posi, inputs_nega = {"prompt": prompt}, {"negative_prompt": ""}
@@ -67,13 +70,46 @@ def _prepare_edit_inputs(pipe, prompt, content, style, seed, num_inference_steps
         "edit_rope_interpolation": False, "context_image": None,
         "zero_cond_t": False,
     }
+    spherical_embedder_used = False
     for unit in pipe.units:
+        if spherical_padding_px is not None and isinstance(unit, QwenImageUnit_EditImageEmbedder):
+            unit = _SphericalEditImageEmbedder(spherical_padding_px)
+            spherical_embedder_used = True
         inputs_shared, inputs_posi, inputs_nega = pipe.unit_runner(
             unit, pipe, inputs_shared, inputs_posi, inputs_nega
         )
+    if spherical_padding_px is not None and not spherical_embedder_used:
+        raise RuntimeError("The pipeline has no supported Qwen edit image embedder.")
     return inputs_shared, inputs_posi, inputs_nega
 
-from diffsynth.pipelines.qwen_image import QwenImagePipeline, ModelConfig
+from diffsynth.pipelines.qwen_image import (
+    QwenImagePipeline, ModelConfig, QwenImageUnit_EditImageEmbedder,
+)
+from telestyle_spherope import spherical_rope_context
+
+
+class _SphericalEditImageEmbedder(QwenImageUnit_EditImageEmbedder):
+    """Encode padded ERP content and an ordinary style image without resizing."""
+
+    def __init__(self, padding_px):
+        super().__init__()
+        self.padding_px = padding_px
+
+    def process(self, pipe, edit_image, tiled, tile_size, tile_stride, edit_image_auto_resize=False):
+        if edit_image_auto_resize or not isinstance(edit_image, (list, tuple)) or len(edit_image) != 2:
+            raise ValueError("Spherical editing requires content and style images without auto-resize.")
+        pipe.load_models_to_device(self.onload_model_names)
+        content, style = edit_image
+        tensor = pipe.preprocess_image(content).to(device=pipe.device, dtype=pipe.torch_dtype)
+        padded = make_spherical_latent_canvas(tensor, self.padding_px, self.padding_px)
+        content_latent = pipe.vae.encode(padded, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        pad = self.padding_px // 8
+        content_latent = content_latent[
+            ..., pad:pad + content.height // 8, pad:pad + content.width // 8
+        ].contiguous()
+        style_result = super().process(pipe, style, tiled, tile_size, tile_stride, False)
+        return {"edit_latents": [content_latent, style_result["edit_latents"]], "edit_image": [content, style]}
+
 
 
 
@@ -460,6 +496,54 @@ class ImageStyleInference:
         image = pipe.vae_output_to_image(image)
         pipe.load_models_to_device([])
         return image
+
+    @torch.no_grad()
+    def inference_with_spherope(
+        self, prompt, content, style, seed, num_inference_steps,
+        padding_px=128, return_latents=False, enable_spherope=True,
+    ):
+        """Denoise a complete ERP with spherical RoPE and padded VAE boundaries."""
+        height, width = content.height, content.width
+        if height < 16 or width != 2 * height or height % 16:
+            raise ValueError("SpheRoPE requires a 2:1 ERP with dimensions divisible by 16.")
+        if num_inference_steps <= 0:
+            raise ValueError("num_inference_steps must be greater than zero.")
+        if padding_px < 0 or padding_px % 16 or padding_px > min(height, width):
+            raise ValueError("padding_px must be nonnegative, divisible by 16, and fit the ERP dimensions.")
+        pipe = self.pipe
+        pipe.scheduler.set_timesteps(
+            num_inference_steps, denoising_strength=1.0,
+            dynamic_shift_len=(height // 16) * (width // 16),
+        )
+        try:
+            shared, posi, nega = _prepare_edit_inputs(
+                pipe, prompt, content, style, seed, num_inference_steps,
+                spherical_padding_px=padding_px,
+            )
+            if shared["latents"].shape != shared["edit_latents"][0].shape:
+                raise ValueError("ERP content and output latent shapes must match.")
+            pipe.load_models_to_device(pipe.in_iteration_models)
+            models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
+            with spherical_rope_context(pipe.dit, enabled=enable_spherope):
+                for progress_id, timestep in enumerate(tqdm(pipe.scheduler.timesteps, desc="TeleStyle SpheRoPE")):
+                    timestep = timestep.unsqueeze(0).to(dtype=pipe.torch_dtype, device=pipe.device)
+                    prediction = pipe.cfg_guided_model_fn(
+                        pipe.model_fn, 1.0, shared, posi, nega,
+                        **models, timestep=timestep, progress_id=progress_id,
+                    )
+                    shared["latents"] = pipe.step(
+                        pipe.scheduler, progress_id=progress_id, noise_pred=prediction, **shared
+                    )
+            if return_latents:
+                return shared["latents"]
+            pad = padding_px // 8
+            latent = make_spherical_latent_canvas(shared["latents"], pad, pad)
+            pipe.load_models_to_device(["vae"])
+            decoded = pipe.vae.decode(latent, device=pipe.device, tiled=False)
+            image = pipe.vae_output_to_image(decoded)
+            return image.crop((padding_px, padding_px, padding_px + width, padding_px + height))
+        finally:
+            pipe.load_models_to_device([])
 
     @torch.no_grad()
     def inference_with_hemisphere_latent_sync(

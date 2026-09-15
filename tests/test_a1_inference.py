@@ -308,22 +308,22 @@ class A1PanoramaRoutingTests(unittest.TestCase):
                 return_latents=True, return_chart_images=True,
             )
 
-    def test_default_and_a1_paths_route_independently(self):
+    def test_hemisphere_and_a1_paths_route_independently(self):
         content = Image.new("RGB", (64, 32), "gray")
         style = Image.new("RGB", (16, 16), "blue")
         engine = _FakePanoramaEngine()
         baseline, _, _ = stylize_panorama(
             engine, content, style, "prompt", 123, 4, 16, 0,
-            hemisphere_size=32, use_sphere_adapter=False,
+            panorama_mode="hemisphere", hemisphere_size=32, use_sphere_adapter=False,
         )
         adapter, _, _ = stylize_panorama(
             engine, content, style, "prompt", 123, 4, 16, 0,
-            hemisphere_size=32, use_sphere_adapter=True,
+            panorama_mode="hemisphere", hemisphere_size=32, use_sphere_adapter=True,
         )
         self.assertEqual(engine.baseline_calls, 1)
         no_a1, _, _ = stylize_panorama(
             engine, content, style, "prompt", 123, 4, 16, 0,
-            hemisphere_size=32, rgb_hard_cut_without_a1=True,
+            panorama_mode="hemisphere", hemisphere_size=32, rgb_hard_cut_without_a1=True,
         )
         self.assertEqual(engine.a1_calls, 1)
         self.assertEqual(engine.no_a1_calls, 1)
@@ -333,7 +333,7 @@ class A1PanoramaRoutingTests(unittest.TestCase):
 
         result = stylize_panorama(
             engine, content, style, "prompt", 123, 4, 16, 0,
-            hemisphere_size=32, use_sphere_adapter=True,
+            panorama_mode="hemisphere", hemisphere_size=32, use_sphere_adapter=True,
             return_chart_images=True,
         )
         self.assertEqual(result[0].size, content.size)

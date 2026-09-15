@@ -1,9 +1,7 @@
-"""Spherical-chart stylization for equirectangular panoramas (ERP).
+"""ERP stylization with full-panorama SpheRoPE by default.
 
-The default path denoises overlapping north/south stereographic charts,
-synchronizes their shared equatorial latents after every scheduler step, and
-decodes one spherical-padded ERP latent.  The previous wrapped ERP path remains
-available as an explicit legacy mode.
+Overlapping hemisphere charts and wrapped ERP generation remain available
+as explicit hemisphere and legacy modes.
 """
 
 import argparse
@@ -188,6 +186,34 @@ def _effective_decode_padding(
     return padding - padding % 16
 
 
+def _validate_panorama_mode(
+    panorama_mode, enable_polar_fusion=False, use_sphere_adapter=False,
+    rgb_hard_cut_without_a1=False, return_chart_images=False,
+):
+    """Reject incompatible panorama features before allocating model state."""
+    if panorama_mode not in ("spherope", "hemisphere", "legacy"):
+        raise ValueError("panorama_mode must be 'spherope', 'hemisphere', or 'legacy'.")
+    if use_sphere_adapter and rgb_hard_cut_without_a1:
+        raise ValueError("A1 and no-A1 RGB hard-cut modes are mutually exclusive.")
+    if panorama_mode != "hemisphere" and (
+        use_sphere_adapter or rgb_hard_cut_without_a1 or return_chart_images
+    ):
+        raise ValueError("A1, RGB hard-cut, and chart image output require --panorama-mode hemisphere.")
+    if enable_polar_fusion and panorama_mode != "legacy":
+        raise ValueError("legacy polar options require --panorama-mode legacy.")
+
+
+def _spherope_working_size(content, steps, decode_padding_px):
+    """Validate a full ERP and return its aligned size and effective padding."""
+    if content.width < 32 or content.height < 16 or content.width != 2 * content.height:
+        raise ValueError("SpheRoPE content must be a 2:1 ERP of at least 32x16 pixels.")
+    if steps <= 0:
+        raise ValueError("steps must be greater than zero.")
+    height = _nearest_multiple_of_16(content.height)
+    size = (2 * height, height)
+    return size, _effective_decode_padding(size, decode_padding_px)
+
+
 def stylize_panorama(
     engine: ImageStyleInference,
     content: Image.Image,
@@ -209,7 +235,7 @@ def stylize_panorama(
     polar_detail_end_degrees: float = 88.0,
     polar_detail_radius_latent: int = 24,
     polar_detail_steps: int = 2,
-    panorama_mode: str = "hemisphere",
+    panorama_mode: str = "spherope",
     hemisphere_size: int | None = None,
     hemisphere_overlap_degrees: float = 15.0,
     decode_padding_px: int = 128,
@@ -217,9 +243,21 @@ def stylize_panorama(
     rgb_hard_cut_without_a1: bool = False,
     return_chart_images: bool = False,
 ):
-    """Stylize an ERP with synchronized hemisphere charts or the legacy path."""
-    if use_sphere_adapter and rgb_hard_cut_without_a1:
-        raise ValueError("A1 and no-A1 RGB hard-cut modes are mutually exclusive.")
+    """Stylize a complete ERP using SpheRoPE, hemisphere charts, or legacy wrap."""
+    _validate_panorama_mode(
+        panorama_mode, enable_polar_fusion, use_sphere_adapter,
+        rgb_hard_cut_without_a1, return_chart_images,
+    )
+    if panorama_mode == "spherope":
+        target_size, padding = _spherope_working_size(content, steps, decode_padding_px)
+        working_content = content.convert("RGB").resize(target_size, Image.Resampling.LANCZOS)
+        working_style = style.convert("RGB").resize((1024, 1024), Image.Resampling.LANCZOS)
+        generated = engine.inference_with_spherope(
+            prompt, working_content, working_style, seed, steps, padding_px=padding,
+        )
+        if generated.size != content.size:
+            generated = generated.resize(content.size, Image.Resampling.LANCZOS)
+        return generated, padding, target_size
     if panorama_mode == "legacy":
         if return_chart_images or rgb_hard_cut_without_a1:
             raise ValueError("chart image output requires A1 hemisphere inference.")
@@ -232,10 +270,6 @@ def stylize_panorama(
             polar_detail_start_degrees, polar_detail_end_degrees,
             polar_detail_radius_latent, polar_detail_steps,
         )
-    if panorama_mode != "hemisphere":
-        raise ValueError("panorama_mode must be 'hemisphere' or 'legacy'.")
-    if enable_polar_fusion:
-        raise ValueError("legacy polar options require --panorama-mode legacy.")
 
     content = content.convert("RGB")
     source_size = content.size
@@ -370,7 +404,7 @@ def _validate_a1_args(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Spherical-chart TeleStyle ERP stylization")
+    parser = argparse.ArgumentParser(description="TeleStyle ERP stylization with spherical RoPE")
     parser.add_argument("--content", required=True, help="Input equirectangular panorama")
     parser.add_argument("--style", required=True, help="Style reference image")
     parser.add_argument("--output", required=True, help="Output panorama path")
@@ -378,12 +412,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument(
-        "--panorama-mode", choices=("hemisphere", "legacy"),
-        default="hemisphere", help="Panorama generation method",
+        "--panorama-mode", choices=("spherope", "hemisphere", "legacy"),
+        default="spherope", help="Panorama generation method",
     )
     parser.add_argument(
         "--hemisphere-size", type=int, default=None,
-        help="Square chart size; defaults to the aligned ERP height",
+        help="Hemisphere-only square chart size; defaults to the aligned ERP height",
     )
     parser.add_argument(
         "--hemisphere-overlap-degrees", type=float, default=15.0,
@@ -391,7 +425,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--decode-padding-px", type=int, default=128,
-        help="Spherical padding for baseline ERP decode; unused by A1 RGB hard-cut",
+        help="Spherical VAE padding: encode/decode in spherope, decode in hemisphere; unused by A1",
     )
     parser.add_argument("--margin-px", type=int, default=256, help="Circular extension width")
     parser.add_argument("--blend-px", type=int, default=96, help="Latent seam synchronization width")
@@ -429,6 +463,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     _validate_a1_args(args)
+    _validate_panorama_mode(
+        args.panorama_mode, args.enable_polar_fusion,
+        bool(args.a1_checkpoint), return_chart_images=args.save_a1_chart_images,
+    )
     for path, label in ((args.content, "content"), (args.style, "style")):
         if not os.path.isfile(path):
             raise FileNotFoundError(f"{label} image does not exist: {path}")
@@ -438,6 +476,8 @@ def main() -> None:
     with Image.open(args.style) as image:
         style = image.convert("RGB")
 
+    if args.panorama_mode == "spherope":
+        _spherope_working_size(content, args.steps, args.decode_padding_px)
     engine = ImageStyleInference()
     checkpoint_info = None
     if args.a1_checkpoint:
@@ -562,7 +602,9 @@ def main() -> None:
         )
         extra_outputs.extend([baseline_path, no_a1_path, report_path])
 
-    if args.panorama_mode == "hemisphere":
+    if args.panorama_mode == "spherope":
+        mode_details = f"erp={working_size} | encode_decode_padding={margin}px"
+    elif args.panorama_mode == "hemisphere":
         mode_details = (
             f"chart={working_size} | overlap={args.hemisphere_overlap_degrees}deg | "
             f"decode_padding={margin}px | a1={bool(args.a1_checkpoint)}"

@@ -5,11 +5,12 @@
 | 方法 | 入口 | 用途 |
 | --- | --- | --- |
 | 普通图片风格迁移 | `telestyleimage_inference.py` | 普通平面图片，脚本内使用硬编码示例路径 |
-| Hemisphere 双半球（默认、推荐） | `telestylepanorama_inference.py --panorama-mode hemisphere` | 南北半球 chart 独立去噪、赤道重叠区逐步同步，最后合成一个 ERP latent |
+| SpheRoPE（默认） | `telestylepanorama_inference.py --panorama-mode spherope` | 完整 ERP 单轨迹去噪，球面 RoPE 与球面 padding 编解码，无赤道 chart 拼接 |
+| Hemisphere 双半球 | `telestylepanorama_inference.py --panorama-mode hemisphere` | 南北半球 chart 独立去噪、赤道重叠区逐步同步，最后合成一个 ERP latent |
 | Legacy 环形画布 | `telestylepanorama_inference.py --panorama-mode legacy` | 通过 `[右边缘｜中心全景｜左边缘]` 环形画布同步左右接缝 |
 | Legacy 旋转双分支极区融合 | legacy 加 `--enable-polar-fusion` | 使用旋转后的 B 分支辅助 A 分支改善极区结构 |
 
-推荐优先使用 `hemisphere`。两种 ERP legacy 路径主要用于兼容和对比。
+默认使用 `spherope`；`hemisphere` 和两种 ERP legacy 路径保留用于兼容和对比。A1 checkpoint 仍要求显式指定 `--panorama-mode hemisphere`。
 
 ## 环境与模型
 
@@ -35,7 +36,35 @@ weights/
 
 `weights/` 已被 Git 忽略，不要把模型权重提交到仓库。
 
-## Hemisphere（双半球）方法（核心）
+## SpheRoPE（默认）
+
+内容必须是完整的 `2:1` ERP，至少 `32×16` 像素。内部将高度对齐到 16 的倍数，宽度取其两倍，最终恢复输入尺寸；风格参考图仍缩放为 `1024×1024`。
+
+```bash
+python telestylepanorama_inference.py \
+  --content inputs/panorama.png \
+  --style inputs/style.jpg \
+  --output qwen_style_output/panorama_result.png
+```
+
+显式选择同一模式可追加 `--panorama-mode spherope`。默认保留 `--seed 123`、`--steps 4` 和现有 TeleStyle/Lightning 权重。
+
+### 生成流程
+
+1. 完整 ERP 内容图先做球面 padding，经 VAE 编码后裁回原 latent 网格；普通风格图按原流程编码。
+2. 一份 ERP latent 和一条 scheduler 轨迹覆盖整张全景，所有生成 token 联合参与 attention，不建立南北 chart。
+3. 生成 ERP 和内容 ERP 的宽度轴使用球面 RoPE。高频量化为经度整数谐波，低频交替编码球面 X/Y 坐标；高度、图像身份、文本和风格图的位置编码保持原样。
+4. 去噪结束后对 ERP latent 做球面 padding，VAE 解码并裁剪，恢复原图大小。
+
+球面 padding 的左右方向循环延拓，跨极点使用纬度反射与经度半周平移。`--decode-padding-px` 在本模式同时控制编码和解码，默认 128 像素，限制到工作图最短边的一半并向下对齐到 16；设为 0 可关闭。padding 不增加 DiT 的 ERP token 网格。
+
+该实现借鉴 [SpheRoPE 第 3.2 节](https://arxiv.org/html/2606.32033v1)，采用 Qwen 的原始频率、0.10 的谐波误差容限及token 网格宽度一半的球面半径，并适配 Qwen 居中位置范围。经纬度遵循本仓库的像素中心约定，首末像素列是相邻位置，顶底行也不直接等同于数学极点；只有低频球面子空间要求极点极限汇聚。
+
+这是 Qwen Image Edit 的推理适配版，未加入论文的 Semantic Distortion CFG，也未进行额外训练。CPU 回归只能验证几何、接入与兼容性，实际接缝、极区质量及风格保持仍需 GPU 生图评估。完整 ERP 的 attention 序列更长，显存占用不能按两个 chart 的总像素量直接推断。
+
+`--hemisphere-size`、`--hemisphere-overlap-degrees`、`--margin-px`、`--blend-px` 及 legacy 极区细节参数不参与此模式。A1 checkpoint、chart 输出需要 `hemisphere`，`--enable-polar-fusion` 需要 `legacy`；不兼容组合会报错，不会自动切换模式。
+
+## Hemisphere（双半球）方法
 
 ### 适用输入
 
@@ -62,20 +91,21 @@ weights/
 5. **逐步去噪并同步**：每个 scheduler step 中，两条分支分别预测并更新自己的 latent；更新后只同步双方共同的赤道带，不把一条分支的整份 latent 覆盖给另一条分支。
 6. **合成 ERP latent**：去噪结束后，把南北 chart 按 ERP 像素中心和单位球坐标重投影为一张 ERP latent，并在重叠纬度带平滑融合。
 7. **增加球面 padding**：左右方向使用循环 padding；跨越南北极时使用“纬度反射 + 经度半周平移”，保持真实球面拓扑。
-8. **只解码一次**：对带球面 padding 的最终 ERP latent 执行一次 VAE 解码，再裁掉 padding。默认流程不依赖生成后的 RGB 拼接。
+8. **只解码一次**：对带球面 padding 的最终 ERP latent 执行一次 VAE 解码，再裁掉 padding。该双半球基线流程不依赖生成后的 RGB 拼接。
 9. **恢复原尺寸并保存**：如果内部对齐改变了尺寸，结果会缩放回输入 ERP 的原始宽高；输出目录会自动创建。
 
 南北分支各自完成一次方形 chart 去噪，因此计算量和显存需求通常高于普通单图推理。
 
 ### 最简指令
 
-`hemisphere` 是默认模式，下面的命令即可运行：
+运行双半球模式需要显式指定 `--panorama-mode hemisphere`：
 
 ```bash
 python telestylepanorama_inference.py \
   --content inputs/panorama.png \
   --style inputs/style.jpg \
-  --output qwen_style_output/panorama_result.png
+  --output qwen_style_output/panorama_result.png \
+  --panorama-mode hemisphere
 ```
 
 ### 完整指令
@@ -104,14 +134,14 @@ python telestylepanorama_inference.py \
 | `--prompt` | 内置 ERP 提示词 | 编辑指令 |
 | `--seed` | `123` | 南北分支共用的随机种子 |
 | `--steps` | `4` | 去噪步数，必须大于 0 |
-| `--panorama-mode` | `hemisphere` | 全景图方法，可选 `hemisphere` 或 `legacy` |
+| `--panorama-mode` | `spherope` | 全景图方法，可选 `spherope`、`hemisphere` 或 `legacy`；本节需显式选择 `hemisphere` |
 | `--hemisphere-size` | 输入 ERP 高度对齐到 16 | 单个方形 chart 的边长；显式设置时必须为正且能被 16 整除 |
 | `--hemisphere-overlap-degrees` | `15` | 南北 chart 越过赤道的角度，必须严格位于 `0°–45°` 之间 |
 | `--decode-padding-px` | `128` | 最终 ERP VAE 解码前使用的球面 padding；会限制到有效尺寸并向下对齐到 16 |
 
 如果输入是 `2048×1024` ERP，省略 `--hemisphere-size` 时，chart 默认就是 `1024×1024`。输入高度较大时可以显式降低 chart 尺寸以节省计算量，但细节也可能减少。
 
-`--enable-polar-fusion` 只允许配合 `--panorama-mode legacy`，不能用于 `hemisphere`。
+`--enable-polar-fusion` 只允许配合 `--panorama-mode legacy`，不能用于 `hemisphere` 或 `spherope`。
 
 ### Hemisphere 问题
 
@@ -264,3 +294,13 @@ A1 训练时没有加载 TeleStyle/Lightning LoRA，因此这一组合属于实�
 训练期间的进度条按累计缓存样本计数，并显示当前 step、阶段、loss、gate 和预计剩余时间；样本会跨 epoch 重复抽取，该计数不是去重图片数。
 
 训练入口会在加载大模型前检查 CUDA、显存档位、模型文件、缓存清单和可用空间。检查点只包含 SphereAdapter、EMA、注入 gates、优化器状态及基础模型哈希，不会合并或写回基础 Qwen 模型。
+
+## SpheRoPE CPU 回归
+
+在已安装依赖的 Python 3.11 环境中运行，不加载模型权重：
+
+```bash
+python -m unittest tests.test_spherope tests.test_spherope_inference tests.test_spherical_reprojection tests.test_a1_geometry_losses tests.test_a1_inference tests.test_telestyle_pilot
+```
+
+几何测试覆盖经度周期、低频极点极限、赤道连续和范数保持；接入测试使用真实轻量 Qwen RoPE 与 fake-model，覆盖内容/风格编码、单轨迹去噪、异常恢复、默认路由与旧模式兼容。
