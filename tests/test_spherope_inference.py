@@ -197,6 +197,10 @@ class SphericalRoutingTests(unittest.TestCase):
         class Engine:
             def inference_with_hemisphere_rgb_hard_cut(self, *args, **kwargs):
                 self.color_match_degrees = kwargs["color_match_degrees"]
+                self.residual_degrees = kwargs["seam_residual_degrees"]
+                self.residual_blur_degrees = kwargs[
+                    "seam_residual_blur_degrees"
+                ]
                 self.returns_baseline = kwargs["return_hard_cut_baseline"]
                 return (
                     Image.new("RGB", (64, 32), (200, 210, 220)),
@@ -212,6 +216,8 @@ class SphericalRoutingTests(unittest.TestCase):
         array = np.asarray(result)
         latitude = 90.0 - (np.arange(33) + 0.5) * (180.0 / 33)
         self.assertEqual(engine.color_match_degrees, 6.0)
+        self.assertEqual(engine.residual_degrees, 2.0)
+        self.assertEqual(engine.residual_blur_degrees, 0.5)
         self.assertTrue(engine.returns_baseline)
         self.assertTrue((array[np.abs(latitude) >= 6.0] == (10, 20, 30)).all())
 
@@ -234,6 +240,22 @@ class SphericalRoutingTests(unittest.TestCase):
                 rgb_hard_cut_without_a1=True,
                 hemisphere_overlap_degrees=15.0,
                 hemisphere_color_match_degrees=16.0,
+            )
+
+    def test_residual_parameters_are_validated_before_engine_call(self):
+        base = dict(
+            engine=None, content=Image.new("RGB", (64, 32)),
+            style=Image.new("RGB", (16, 16)), prompt="prompt", seed=123,
+            steps=4, margin_px=256, blend_px=96, panorama_mode="hemisphere",
+            rgb_hard_cut_without_a1=True,
+        )
+        with self.assertRaisesRegex(ValueError, "seam-residual-degrees"):
+            stylize_panorama(
+                **base, hemisphere_seam_residual_degrees=16.0
+            )
+        with self.assertRaisesRegex(ValueError, "residual-blur-degrees"):
+            stylize_panorama(
+                **base, hemisphere_seam_residual_blur_degrees=0.0
             )
 
     def test_cli_rejects_incompatible_options_before_loading_models(self):

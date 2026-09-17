@@ -1,4 +1,5 @@
 import copy
+import math
 import torch
 import os
 import glob
@@ -669,6 +670,8 @@ class ImageStyleInference:
         consistency_degrees=10.0,
         return_latents=False,
         color_match_degrees=6.0,
+        seam_residual_degrees=2.0,
+        seam_residual_blur_degrees=0.5,
         return_hard_cut_baseline=False,
     ):
         """Denoise independent charts and locally match the RGB hard cut."""
@@ -688,9 +691,22 @@ class ImageStyleInference:
             raise ValueError(
                 "color_match_degrees must be between zero and overlap_degrees."
             )
+        if not 0.0 <= seam_residual_degrees <= overlap_degrees:
+            raise ValueError(
+                "seam_residual_degrees must be between zero and overlap_degrees."
+            )
+        if seam_residual_degrees > 0 and (
+            not math.isfinite(seam_residual_blur_degrees)
+            or seam_residual_blur_degrees <= 0
+        ):
+            raise ValueError(
+                "seam_residual_blur_degrees must be positive when enabled."
+            )
 
         from training.geometry import (
-            match_equatorial_low_frequency, reproject_native_charts,
+            correct_equatorial_seam_residual,
+            match_equatorial_low_frequency,
+            reproject_native_charts,
         )
 
         pipe = self.pipe
@@ -772,6 +788,10 @@ class ImageStyleInference:
         matched = match_equatorial_low_frequency(
             projected.north, projected.south, projected.hard_cut,
             projected.latitude_degrees, color_match_degrees,
+        )
+        matched = correct_equatorial_seam_residual(
+            matched, projected.latitude_degrees, seam_residual_degrees,
+            seam_residual_blur_degrees,
         )
         image = pipe.vae_output_to_image(matched)
         del north_decoded, south_decoded, projected, matched

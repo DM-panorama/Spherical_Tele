@@ -286,3 +286,65 @@ def match_equatorial_low_frequency(
     candidate = hard_cut.float() + weight * owner_correction
     inside = (latitude.abs() < match_degrees).unsqueeze(0).unsqueeze(0)
     return torch.where(inside, candidate.to(hard_cut.dtype), hard_cut)
+
+
+def correct_equatorial_seam_residual(
+    source: torch.Tensor,
+    latitude_degrees: torch.Tensor,
+    residual_degrees: float,
+    blur_degrees: float = 0.5,
+) -> torch.Tensor:
+    """Suppress an abnormal equator gradient inside a narrow latitude band."""
+    if source.ndim != 4:
+        raise ValueError("source must have shape [B, C, H, W].")
+    height, width = source.shape[-2:]
+    if height < 4 or height % 2:
+        raise ValueError("source height must be even and at least four.")
+    if latitude_degrees.shape != (height, width):
+        raise ValueError("latitude_degrees must match the ERP spatial dimensions.")
+    if not math.isfinite(residual_degrees) or residual_degrees < 0:
+        raise ValueError("residual_degrees must be finite and non-negative.")
+    if residual_degrees == 0:
+        return source
+    if not math.isfinite(blur_degrees) or blur_degrees <= 0:
+        raise ValueError("blur_degrees must be finite and positive.")
+
+    split = height // 2
+    latitude = latitude_degrees.to(device=source.device, dtype=torch.float32)
+    if not (latitude[split - 1].mean() >= 0 and latitude[split].mean() < 0):
+        raise ValueError("latitude_degrees must cross the equator at half height.")
+
+    working = source.float()
+    actual_gradient = working[..., split, :] - working[..., split - 1, :]
+    expected_gradient = 0.5 * (
+        working[..., split - 1, :] - working[..., split - 2, :]
+        + working[..., split + 1, :] - working[..., split, :]
+    )
+    excess = actual_gradient - expected_gradient
+
+    sigma_pixels = max(1.0, width * blur_degrees / 360.0)
+    radius = min(int(math.ceil(3.0 * sigma_pixels)), width - 1)
+    if radius > 0:
+        coordinates = torch.arange(
+            -radius, radius + 1, device=source.device, dtype=torch.float32
+        )
+        kernel = torch.exp(-0.5 * (coordinates / sigma_pixels).square())
+        kernel = kernel / kernel.sum()
+        kernel = kernel.view(1, 1, -1).expand(source.shape[1], 1, -1)
+        excess = F.conv1d(
+            F.pad(excess, (radius, radius), mode="circular"),
+            kernel,
+            groups=source.shape[1],
+        )
+
+    normalized = (1.0 - latitude.abs() / residual_degrees).clamp(0.0, 1.0)
+    weight = normalized.square() * (3.0 - 2.0 * normalized)
+    weight = weight.unsqueeze(0).unsqueeze(0)
+    correction = torch.where(
+        (latitude >= 0).unsqueeze(0).unsqueeze(0),
+        0.5 * excess.unsqueeze(-2),
+        -0.5 * excess.unsqueeze(-2),
+    )
+    candidate = working + weight * correction
+    inside = (latitude.abs() < residual_degrees).unsqueeze(0).unsqueeze(0)
+    return torch.where(inside, candidate.to(source.dtype), source)

@@ -256,6 +256,8 @@ def stylize_panorama(
     hemisphere_size: int | None = None,
     hemisphere_overlap_degrees: float = 15.0,
     hemisphere_color_match_degrees: float = 6.0,
+    hemisphere_seam_residual_degrees: float = 2.0,
+    hemisphere_seam_residual_blur_degrees: float = 0.5,
     decode_padding_px: int = 128,
     use_sphere_adapter: bool = False,
     rgb_hard_cut_without_a1: bool = False,
@@ -306,6 +308,24 @@ def stylize_panorama(
             "hemisphere-color-match-degrees must be between zero and "
             "hemisphere-overlap-degrees."
         )
+    if rgb_hard_cut_without_a1 and not (
+        0.0 <= hemisphere_seam_residual_degrees <= hemisphere_overlap_degrees
+    ):
+        raise ValueError(
+            "hemisphere-seam-residual-degrees must be between zero and "
+            "hemisphere-overlap-degrees."
+        )
+    if (
+        rgb_hard_cut_without_a1
+        and hemisphere_seam_residual_degrees > 0
+        and (
+            not np.isfinite(hemisphere_seam_residual_blur_degrees)
+            or hemisphere_seam_residual_blur_degrees <= 0
+        )
+    ):
+        raise ValueError(
+            "hemisphere-seam-residual-blur-degrees must be finite and positive."
+        )
     if hemisphere_size is None:
         chart_size = _nearest_multiple_of_16(source_size[1])
     else:
@@ -349,6 +369,10 @@ def stylize_panorama(
                 prompt, content_north, content_south, working_style, seed, steps,
                 target_size[1], target_size[0], hemisphere_overlap_degrees,
                 color_match_degrees=hemisphere_color_match_degrees,
+                seam_residual_degrees=hemisphere_seam_residual_degrees,
+                seam_residual_blur_degrees=(
+                    hemisphere_seam_residual_blur_degrees
+                ),
                 return_hard_cut_baseline=True,
             )
         )
@@ -372,7 +396,11 @@ def stylize_panorama(
             )
     if hard_cut_baseline is not None:
         generated = _restore_outside_equatorial_band(
-            generated, hard_cut_baseline, hemisphere_color_match_degrees
+            generated, hard_cut_baseline,
+            max(
+                hemisphere_color_match_degrees,
+                hemisphere_seam_residual_degrees,
+            ),
         )
     if return_chart_images:
         return (
@@ -464,6 +492,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hemisphere-color-match-degrees", type=float, default=6.0,
         help="No-A1 RGB hard-cut low-frequency matching half-width; zero disables it",
+    )
+    parser.add_argument(
+        "--hemisphere-seam-residual-degrees", type=float, default=2.0,
+        help="No-A1 RGB hard-cut equator residual correction half-width",
+    )
+    parser.add_argument(
+        "--hemisphere-seam-residual-blur-degrees", type=float, default=0.5,
+        help="Longitude smoothing scale for no-A1 equator residual correction",
     )
     parser.add_argument(
         "--decode-padding-px", type=int, default=128,
@@ -561,6 +597,10 @@ def main() -> None:
         "hemisphere_size": args.hemisphere_size,
         "hemisphere_overlap_degrees": args.hemisphere_overlap_degrees,
         "hemisphere_color_match_degrees": args.hemisphere_color_match_degrees,
+        "hemisphere_seam_residual_degrees": args.hemisphere_seam_residual_degrees,
+        "hemisphere_seam_residual_blur_degrees": (
+            args.hemisphere_seam_residual_blur_degrees
+        ),
         "decode_padding_px": args.decode_padding_px,
     }
 
@@ -613,8 +653,12 @@ def main() -> None:
             "hemisphere_size": working_size[0],
             "hemisphere_overlap_degrees": args.hemisphere_overlap_degrees,
             "hemisphere_color_match_degrees": args.hemisphere_color_match_degrees,
+            "hemisphere_seam_residual_degrees": args.hemisphere_seam_residual_degrees,
+            "hemisphere_seam_residual_blur_degrees": (
+                args.hemisphere_seam_residual_blur_degrees
+            ),
             "a1_composition": "decoded_rgb_hard_cut",
-            "no_a1_composition": "independent_decoded_rgb_hard_cut_with_low_frequency_color_match",
+            "no_a1_composition": "independent_decoded_rgb_hard_cut_with_color_and_residual_match",
             "rgb_hard_cut_antialias_scale": 2,
             "south_rgb_yaw_degrees": RGB_HARD_CUT_SOUTH_YAW_DEGREES,
             "south_chart_display_rotation_degrees": (

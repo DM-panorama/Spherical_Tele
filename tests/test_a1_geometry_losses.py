@@ -8,6 +8,7 @@ from telestyle_spherical import extract_stereographic_hemisphere
 
 from training.geometry import (
     build_sphere_geometry,
+    correct_equatorial_seam_residual,
     match_equatorial_low_frequency,
     reproject_native_charts,
     swap_sphere_geometry,
@@ -195,6 +196,60 @@ class A1GeometryLossTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-negative"):
             match_equatorial_low_frequency(
                 source, source, source, latitude, -1.0
+            )
+
+    def test_equatorial_residual_correction_restores_natural_gradient(self):
+        height, width = 180, 360
+        latitude = 90.0 - (torch.arange(height).float() + 0.5) * (180.0 / height)
+        latitude = latitude[:, None].expand(height, width)
+        ramp = torch.arange(height).float().view(1, 1, height, 1) * 0.001
+        source = ramp.expand(1, 3, height, width).clone()
+        source[..., height // 2 :, :] += 0.2
+        split = height // 2
+        expected = 0.001
+        before = source[..., split, :] - source[..., split - 1, :]
+
+        corrected = correct_equatorial_seam_residual(
+            source, latitude, residual_degrees=2.0, blur_degrees=0.5
+        )
+        after = corrected[..., split, :] - corrected[..., split - 1, :]
+        self.assertLess(
+            float((after - expected).abs().mean()),
+            float((before - expected).abs().mean()) * 0.2,
+        )
+        outside = (latitude.abs() >= 2.0)[None, None].expand_as(source)
+        self.assertTrue(torch.equal(corrected[outside], source[outside]))
+        north_delta = corrected[..., split - 1, :] - source[..., split - 1, :]
+        south_delta = corrected[..., split, :] - source[..., split, :]
+        torch.testing.assert_close(north_delta, -south_delta, atol=1e-6, rtol=0)
+
+    def test_equatorial_residual_disable_and_circular_shift(self):
+        height, width = 32, 64
+        generator = torch.Generator().manual_seed(11)
+        source = torch.rand(1, 3, height, width, generator=generator)
+        latitude = 90.0 - (torch.arange(height).float() + 0.5) * (180.0 / height)
+        latitude = latitude[:, None].expand(height, width)
+        self.assertTrue(torch.equal(
+            correct_equatorial_seam_residual(source, latitude, 0.0), source
+        ))
+
+        corrected = correct_equatorial_seam_residual(
+            source, latitude, residual_degrees=6.0, blur_degrees=0.5
+        )
+        shift = 9
+        shifted = correct_equatorial_seam_residual(
+            torch.roll(source, shift, -1), latitude,
+            residual_degrees=6.0, blur_degrees=0.5,
+        )
+        torch.testing.assert_close(shifted, torch.roll(corrected, shift, -1))
+
+    def test_equatorial_residual_rejects_invalid_blur(self):
+        source = torch.zeros(1, 3, 8, 16)
+        latitude = 90.0 - (torch.arange(8).float() + 0.5) * (180.0 / 8)
+        latitude = latitude[:, None].expand(8, 16)
+        with self.assertRaisesRegex(ValueError, "finite and positive"):
+            correct_equatorial_seam_residual(
+                source, latitude, residual_degrees=2.0, blur_degrees=0.0
             )
 
 
