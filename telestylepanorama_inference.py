@@ -37,6 +37,23 @@ def _nearest_multiple_of_16(value: int) -> int:
     return max(16, int(round(value / 16.0)) * 16)
 
 
+def _restore_outside_equatorial_band(
+    repaired: Image.Image, baseline: Image.Image, band_degrees: float,
+) -> Image.Image:
+    """Copy baseline RGB exactly outside the requested latitude band."""
+    if repaired.size != baseline.size:
+        raise ValueError("repaired and baseline images must have identical sizes.")
+    if band_degrees == 0:
+        return baseline.copy()
+    repaired_array = np.asarray(repaired.convert("RGB"))
+    baseline_array = np.asarray(baseline.convert("RGB")).copy()
+    height = repaired_array.shape[0]
+    latitude = 90.0 - (np.arange(height, dtype=np.float32) + 0.5) * (180.0 / height)
+    inside = np.abs(latitude) < band_degrees
+    baseline_array[inside, :, :] = repaired_array[inside, :, :]
+    return Image.fromarray(baseline_array, "RGB")
+
+
 def _aligned_margin(width: int, requested_margin: int) -> int:
     """Clamp a circular extension to half the panorama width and align it."""
     if requested_margin <= 0:
@@ -238,6 +255,7 @@ def stylize_panorama(
     panorama_mode: str = "spherope",
     hemisphere_size: int | None = None,
     hemisphere_overlap_degrees: float = 15.0,
+    hemisphere_color_match_degrees: float = 6.0,
     decode_padding_px: int = 128,
     use_sphere_adapter: bool = False,
     rgb_hard_cut_without_a1: bool = False,
@@ -281,6 +299,13 @@ def stylize_panorama(
         raise ValueError(
             "hemisphere-overlap-degrees must be between zero and 45."
         )
+    if rgb_hard_cut_without_a1 and not (
+        0.0 <= hemisphere_color_match_degrees <= hemisphere_overlap_degrees
+    ):
+        raise ValueError(
+            "hemisphere-color-match-degrees must be between zero and "
+            "hemisphere-overlap-degrees."
+        )
     if hemisphere_size is None:
         chart_size = _nearest_multiple_of_16(source_size[1])
     else:
@@ -309,6 +334,7 @@ def stylize_panorama(
     )
     if return_chart_images and not use_sphere_adapter:
         raise ValueError("chart image output requires an enabled A1 adapter.")
+    hard_cut_baseline = None
     if return_chart_images:
         generated, north_image, south_image = (
             engine.inference_with_hemisphere_sphere_adapter(
@@ -318,9 +344,13 @@ def stylize_panorama(
             )
         )
     elif rgb_hard_cut_without_a1:
-        generated = engine.inference_with_hemisphere_rgb_hard_cut(
-            prompt, content_north, content_south, working_style, seed, steps,
-            target_size[1], target_size[0], hemisphere_overlap_degrees,
+        generated, hard_cut_baseline = (
+            engine.inference_with_hemisphere_rgb_hard_cut(
+                prompt, content_north, content_south, working_style, seed, steps,
+                target_size[1], target_size[0], hemisphere_overlap_degrees,
+                color_match_degrees=hemisphere_color_match_degrees,
+                return_hard_cut_baseline=True,
+            )
         )
     elif use_sphere_adapter:
         generated = engine.inference_with_hemisphere_sphere_adapter(
@@ -336,6 +366,14 @@ def stylize_panorama(
         )
     if generated.size != source_size:
         generated = generated.resize(source_size, Image.Resampling.LANCZOS)
+        if hard_cut_baseline is not None:
+            hard_cut_baseline = hard_cut_baseline.resize(
+                source_size, Image.Resampling.LANCZOS
+            )
+    if hard_cut_baseline is not None:
+        generated = _restore_outside_equatorial_band(
+            generated, hard_cut_baseline, hemisphere_color_match_degrees
+        )
     if return_chart_images:
         return (
             generated, effective_decode_padding, (chart_size, chart_size),
@@ -422,6 +460,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hemisphere-overlap-degrees", type=float, default=15.0,
         help="Angular overlap across the equator for latent synchronization",
+    )
+    parser.add_argument(
+        "--hemisphere-color-match-degrees", type=float, default=6.0,
+        help="No-A1 RGB hard-cut low-frequency matching half-width; zero disables it",
     )
     parser.add_argument(
         "--decode-padding-px", type=int, default=128,
@@ -518,6 +560,7 @@ def main() -> None:
         "panorama_mode": args.panorama_mode,
         "hemisphere_size": args.hemisphere_size,
         "hemisphere_overlap_degrees": args.hemisphere_overlap_degrees,
+        "hemisphere_color_match_degrees": args.hemisphere_color_match_degrees,
         "decode_padding_px": args.decode_padding_px,
     }
 
@@ -569,8 +612,9 @@ def main() -> None:
             "steps": args.steps,
             "hemisphere_size": working_size[0],
             "hemisphere_overlap_degrees": args.hemisphere_overlap_degrees,
+            "hemisphere_color_match_degrees": args.hemisphere_color_match_degrees,
             "a1_composition": "decoded_rgb_hard_cut",
-            "no_a1_composition": "independent_decoded_rgb_hard_cut",
+            "no_a1_composition": "independent_decoded_rgb_hard_cut_with_low_frequency_color_match",
             "rgb_hard_cut_antialias_scale": 2,
             "south_rgb_yaw_degrees": RGB_HARD_CUT_SOUTH_YAW_DEGREES,
             "south_chart_display_rotation_degrees": (

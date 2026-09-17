@@ -8,6 +8,7 @@ from telestyle_spherical import extract_stereographic_hemisphere
 
 from training.geometry import (
     build_sphere_geometry,
+    match_equatorial_low_frequency,
     reproject_native_charts,
     swap_sphere_geometry,
     rotate_erp,
@@ -124,6 +125,77 @@ class A1GeometryLossTests(unittest.TestCase):
             atol=2e-5,
             rtol=0,
         )
+
+    def test_equatorial_color_match_reduces_offset_and_preserves_outside(self):
+        height, width = 180, 360
+        north = torch.full((1, 3, height, width), 0.8)
+        south = torch.full_like(north, 0.2)
+        latitude = 90.0 - (torch.arange(height).float() + 0.5) * (180.0 / height)
+        latitude = latitude[:, None].expand(height, width)
+        hard_cut = torch.where(
+            (latitude >= 0)[None, None], north, south
+        )
+        matched = match_equatorial_low_frequency(
+            north, south, hard_cut, latitude, match_degrees=6.0
+        )
+
+        split = height // 2
+        original_jump = (hard_cut[..., split - 1, :] - hard_cut[..., split, :]).abs().mean()
+        matched_jump = (matched[..., split - 1, :] - matched[..., split, :]).abs().mean()
+        self.assertLess(float(matched_jump), float(original_jump) * 0.1)
+        outside = (latitude.abs() >= 6.0)[None, None].expand_as(hard_cut)
+        self.assertTrue(torch.equal(matched[outside], hard_cut[outside]))
+
+    def test_equatorial_color_match_preserves_owner_high_frequency(self):
+        height, width = 64, 128
+        texture = (torch.arange(width) % 2).float().view(1, 1, 1, width) * 0.1
+        texture = texture.expand(1, 3, height, width)
+        north = texture + 0.6
+        south = texture + 0.2
+        latitude = 90.0 - (torch.arange(height).float() + 0.5) * (180.0 / height)
+        latitude = latitude[:, None].expand(height, width)
+        hard_cut = torch.where((latitude >= 0)[None, None], north, south)
+        matched = match_equatorial_low_frequency(
+            north, south, hard_cut, latitude, match_degrees=6.0
+        )
+
+        row = height // 2 - 1
+        torch.testing.assert_close(
+            matched[..., row, 1:] - matched[..., row, :-1],
+            hard_cut[..., row, 1:] - hard_cut[..., row, :-1],
+            atol=1e-6, rtol=0,
+        )
+
+    def test_equatorial_color_match_disable_and_circular_shift(self):
+        height, width = 32, 64
+        generator = torch.Generator().manual_seed(7)
+        north = torch.rand(1, 3, height, width, generator=generator)
+        south = torch.rand(1, 3, height, width, generator=generator)
+        latitude = 90.0 - (torch.arange(height).float() + 0.5) * (180.0 / height)
+        latitude = latitude[:, None].expand(height, width)
+        hard_cut = torch.where((latitude >= 0)[None, None], north, south)
+        self.assertTrue(torch.equal(
+            match_equatorial_low_frequency(north, south, hard_cut, latitude, 0.0),
+            hard_cut,
+        ))
+
+        matched = match_equatorial_low_frequency(
+            north, south, hard_cut, latitude, 6.0
+        )
+        shift = 11
+        shifted = match_equatorial_low_frequency(
+            torch.roll(north, shift, -1), torch.roll(south, shift, -1),
+            torch.roll(hard_cut, shift, -1), latitude, 6.0,
+        )
+        torch.testing.assert_close(shifted, torch.roll(matched, shift, -1))
+
+    def test_equatorial_color_match_rejects_negative_width(self):
+        source = torch.zeros(1, 3, 8, 16)
+        latitude = torch.zeros(8, 16)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            match_equatorial_low_frequency(
+                source, source, source, latitude, -1.0
+            )
 
 
 if __name__ == "__main__":

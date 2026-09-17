@@ -668,8 +668,10 @@ class ImageStyleInference:
         overlap_degrees=15.0,
         consistency_degrees=10.0,
         return_latents=False,
+        color_match_degrees=6.0,
+        return_hard_cut_baseline=False,
     ):
-        """Denoise independent base-model charts and hard-cut decoded RGB."""
+        """Denoise independent charts and locally match the RGB hard cut."""
         if content_north.size != content_south.size:
             raise ValueError("north and south hemisphere charts must have identical sizes.")
         if content_north.width != content_north.height or content_north.width % 16:
@@ -682,8 +684,14 @@ class ImageStyleInference:
             raise ValueError("RGB hard-cut output must have a 2:1 aspect ratio.")
         if num_inference_steps <= 0:
             raise ValueError("num_inference_steps must be greater than zero.")
+        if not 0.0 <= color_match_degrees <= overlap_degrees:
+            raise ValueError(
+                "color_match_degrees must be between zero and overlap_degrees."
+            )
 
-        from training.geometry import reproject_native_charts
+        from training.geometry import (
+            match_equatorial_low_frequency, reproject_native_charts,
+        )
 
         pipe = self.pipe
         chart_size = content_north.width
@@ -757,9 +765,19 @@ class ImageStyleInference:
             # Keep the native chart longitude convention for final ERP composition.
             south_yaw_degrees=RGB_HARD_CUT_SOUTH_YAW_DEGREES,
         )
-        image = pipe.vae_output_to_image(projected.hard_cut)
-        del north_decoded, south_decoded, projected
+        hard_cut_image = (
+            pipe.vae_output_to_image(projected.hard_cut)
+            if return_hard_cut_baseline else None
+        )
+        matched = match_equatorial_low_frequency(
+            projected.north, projected.south, projected.hard_cut,
+            projected.latitude_degrees, color_match_degrees,
+        )
+        image = pipe.vae_output_to_image(matched)
+        del north_decoded, south_decoded, projected, matched
         pipe.load_models_to_device([])
+        if return_hard_cut_baseline:
+            return image, hard_cut_image
         return image
 
 

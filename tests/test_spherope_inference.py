@@ -12,7 +12,9 @@ from diffsynth.diffusion.base_pipeline import PipelineUnit, PipelineUnitRunner
 from diffsynth.models.qwen_image_dit import QwenEmbedRope
 from diffsynth.pipelines.qwen_image import QwenImageUnit_EditImageEmbedder
 from telestyleimage_inference import ImageStyleInference, _prepare_edit_inputs
-from telestylepanorama_inference import main, parse_args, stylize_panorama
+from telestylepanorama_inference import (
+    _restore_outside_equatorial_band, main, parse_args, stylize_panorama,
+)
 from telestyle_spherope import QwenSphericalRoPE
 
 
@@ -190,6 +192,49 @@ class SphericalRoutingTests(unittest.TestCase):
         ):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 stylize_panorama(**(base | change))
+
+    def test_no_a1_hard_cut_routes_color_match_and_restores_after_resize(self):
+        class Engine:
+            def inference_with_hemisphere_rgb_hard_cut(self, *args, **kwargs):
+                self.color_match_degrees = kwargs["color_match_degrees"]
+                self.returns_baseline = kwargs["return_hard_cut_baseline"]
+                return (
+                    Image.new("RGB", (64, 32), (200, 210, 220)),
+                    Image.new("RGB", (64, 32), (10, 20, 30)),
+                )
+
+        engine = Engine()
+        result, _, _ = stylize_panorama(
+            engine, Image.new("RGB", (66, 33)), Image.new("RGB", (16, 16)),
+            "prompt", 123, 1, 256, 96, panorama_mode="hemisphere",
+            rgb_hard_cut_without_a1=True, hemisphere_color_match_degrees=6.0,
+        )
+        array = np.asarray(result)
+        latitude = 90.0 - (np.arange(33) + 0.5) * (180.0 / 33)
+        self.assertEqual(engine.color_match_degrees, 6.0)
+        self.assertTrue(engine.returns_baseline)
+        self.assertTrue((array[np.abs(latitude) >= 6.0] == (10, 20, 30)).all())
+
+    def test_equatorial_band_restore_keeps_outside_rgb_exact(self):
+        baseline = Image.new("RGB", (20, 10), (10, 20, 30))
+        repaired = Image.new("RGB", (20, 10), (200, 210, 220))
+        result = np.asarray(
+            _restore_outside_equatorial_band(repaired, baseline, 20.0)
+        )
+        latitude = 90.0 - (np.arange(10) + 0.5) * 18.0
+        inside = np.abs(latitude) < 20.0
+        self.assertTrue((result[~inside] == (10, 20, 30)).all())
+        self.assertTrue((result[inside] == (200, 210, 220)).all())
+
+    def test_color_match_band_cannot_exceed_overlap(self):
+        with self.assertRaisesRegex(ValueError, "color-match-degrees"):
+            stylize_panorama(
+                None, Image.new("RGB", (64, 32)), Image.new("RGB", (16, 16)),
+                "prompt", 123, 4, 256, 96, panorama_mode="hemisphere",
+                rgb_hard_cut_without_a1=True,
+                hemisphere_overlap_degrees=15.0,
+                hemisphere_color_match_degrees=16.0,
+            )
 
     def test_cli_rejects_incompatible_options_before_loading_models(self):
         base = ["prog", "--content", "unused", "--style", "unused", "--output", "unused"]

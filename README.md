@@ -137,6 +137,7 @@ python telestylepanorama_inference.py \
 | `--panorama-mode` | `spherope` | 全景图方法，可选 `spherope`、`hemisphere` 或 `legacy`；本节需显式选择 `hemisphere` |
 | `--hemisphere-size` | 输入 ERP 高度对齐到 16 | 单个方形 chart 的边长；显式设置时必须为正且能被 16 整除 |
 | `--hemisphere-overlap-degrees` | `15` | 南北 chart 越过赤道的角度，必须严格位于 `0°–45°` 之间 |
+| `--hemisphere-color-match-degrees` | `6` | 仅无 A1 RGB 硬拼：在赤道上下该角度内对称匹配低频颜色；设为 `0` 关闭，且不能超过 overlap |
 | `--decode-padding-px` | `128` | 最终 ERP VAE 解码前使用的球面 padding；会限制到有效尺寸并向下对齐到 16 |
 
 如果输入是 `2048×1024` ERP，省略 `--hemisphere-size` 时，chart 默认就是 `1024×1024`。输入高度较大时可以显式降低 chart 尺寸以节省计算量，但细节也可能减少。
@@ -287,7 +288,7 @@ python telestylepanorama_inference.py \
     --save-a1-chart-images
 ```
 
-A/B 模式一次生成五张图片：`telestyle_a1_rgb_hardcut_baseline.png`（原版 latent 合成 baseline）、`telestyle_no_a1_rgb_hardcut.png`（无 A1 的独立双半球 RGB 硬拼）、`telestyle_a1_rgb_hardcut.png`（A1 RGB 硬拼）、`telestyle_a1_rgb_hardcut_north_chart.png` 和 `telestyle_a1_rgb_hardcut_south_chart.png`。另外写出 `telestyle_a1_rgb_hardcut_report.json`，不再生成 comparison 拼图。南北 chart 是去噪后分别解码的 1024×1024 方形图。A1 最终图不再合成 ERP latent，而是把两张 decoded RGB chart 按原生球面坐标以 2 倍分辨率重投影到 ERP，在赤道硬拼后使用 area 抗锯齿缩小。最终 ERP 不对南半球额外施加 yaw；单独保存的 south chart 会旋转 180°，以便与 north chart 按相同观察方向比较。报告中的左右接缝误差与像素差只能辅助比较，风格强度、极区纹理和结构稳定性仍需查看原尺寸 ERP。
+A/B 模式一次生成五张图片：`telestyle_a1_rgb_hardcut_baseline.png`（原版 latent 合成 baseline）、`telestyle_no_a1_rgb_hardcut.png`（无 A1 的独立双半球 RGB 硬拼，并在赤道带匹配低频颜色）、`telestyle_a1_rgb_hardcut.png`（A1 RGB 硬拼）、`telestyle_a1_rgb_hardcut_north_chart.png` 和 `telestyle_a1_rgb_hardcut_south_chart.png`。另外写出 `telestyle_a1_rgb_hardcut_report.json`，不再生成 comparison 拼图。南北 chart 是去噪后分别解码的 1024×1024 方形图。A1 最终图不再合成 ERP latent，而是把两张 decoded RGB chart 按原生球面坐标以 2 倍分辨率重投影到 ERP，在赤道硬拼后使用 area 抗锯齿缩小。颜色匹配只修正赤道带内的低频分量，带外最终 RGB 逐像素沿用原硬拼结果。最终 ERP 不对南半球额外施加 yaw；单独保存的 south chart 会旋转 180°，以便与 north chart 按相同观察方向比较。报告中的左右接缝误差与像素差只能辅助比较，风格强度、极区纹理和结构稳定性仍需查看原尺寸 ERP。
 
 A1 训练时没有加载 TeleStyle/Lightning LoRA，因此这一组合属于实验性推理。checkpoint 中的 chart size 必须与 `--hemisphere-size` 一致；不传任何 A1 参数时，原有生图路径不变。
 

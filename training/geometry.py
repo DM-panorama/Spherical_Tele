@@ -213,3 +213,76 @@ def reproject_native_charts(
         consistency_mask=mask,
         latitude_degrees=latitude,
     )
+
+
+def _circular_gaussian_blur(
+    source: torch.Tensor,
+    sigma_pixels: float,
+) -> torch.Tensor:
+    """Blur an ERP with circular longitude and reflected latitude padding."""
+    if source.ndim != 4:
+        raise ValueError("source must have shape [B, C, H, W].")
+    if not math.isfinite(sigma_pixels) or sigma_pixels <= 0:
+        raise ValueError("sigma_pixels must be finite and positive.")
+
+    height, width = source.shape[-2:]
+    radius = min(int(math.ceil(3.0 * sigma_pixels)), height - 1, width - 1)
+    working = source.float()
+    if radius <= 0:
+        return working
+
+    coordinates = torch.arange(
+        -radius, radius + 1, device=source.device, dtype=torch.float32
+    )
+    kernel_1d = torch.exp(-0.5 * (coordinates / sigma_pixels).square())
+    kernel_1d = kernel_1d / kernel_1d.sum()
+    channels = source.shape[1]
+
+    horizontal = kernel_1d.view(1, 1, 1, -1).expand(channels, 1, 1, -1)
+    working = F.pad(working, (radius, radius, 0, 0), mode="circular")
+    working = F.conv2d(working, horizontal, groups=channels)
+
+    vertical = kernel_1d.view(1, 1, -1, 1).expand(channels, 1, -1, 1)
+    working = F.pad(working, (0, 0, radius, radius), mode="reflect")
+    return F.conv2d(working, vertical, groups=channels)
+
+
+def match_equatorial_low_frequency(
+    north_erp: torch.Tensor,
+    south_erp: torch.Tensor,
+    hard_cut: torch.Tensor,
+    latitude_degrees: torch.Tensor,
+    match_degrees: float,
+    blur_degrees: float = 1.0,
+) -> torch.Tensor:
+    """Symmetrically match low-frequency color inside an equatorial band."""
+    if north_erp.ndim != 4 or north_erp.shape != south_erp.shape:
+        raise ValueError("north_erp and south_erp must have identical [B, C, H, W] shapes.")
+    if hard_cut.shape != north_erp.shape:
+        raise ValueError("hard_cut must match the reprojected chart shapes.")
+    if latitude_degrees.shape != north_erp.shape[-2:]:
+        raise ValueError("latitude_degrees must match the ERP spatial dimensions.")
+    if not math.isfinite(match_degrees) or match_degrees < 0:
+        raise ValueError("match_degrees must be finite and non-negative.")
+    if not math.isfinite(blur_degrees) or blur_degrees <= 0:
+        raise ValueError("blur_degrees must be finite and positive.")
+    if match_degrees == 0:
+        return hard_cut
+
+    sigma_pixels = max(1.0, north_erp.shape[-2] * blur_degrees / 180.0)
+    north_low = _circular_gaussian_blur(north_erp, sigma_pixels)
+    south_low = _circular_gaussian_blur(south_erp, sigma_pixels)
+    difference = south_low - north_low
+
+    latitude = latitude_degrees.to(device=hard_cut.device, dtype=torch.float32)
+    normalized = (1.0 - latitude.abs() / match_degrees).clamp(0.0, 1.0)
+    weight = normalized.square() * (3.0 - 2.0 * normalized)
+    weight = weight.unsqueeze(0).unsqueeze(0)
+    owner_correction = torch.where(
+        (latitude >= 0).unsqueeze(0).unsqueeze(0),
+        0.5 * difference,
+        -0.5 * difference,
+    )
+    candidate = hard_cut.float() + weight * owner_correction
+    inside = (latitude.abs() < match_degrees).unsqueeze(0).unsqueeze(0)
+    return torch.where(inside, candidate.to(hard_cut.dtype), hard_cut)
