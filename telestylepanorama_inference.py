@@ -1,28 +1,14 @@
-"""ERP stylization with full-panorama SpheRoPE by default.
-
-Overlapping hemisphere charts and wrapped ERP generation remain available
-as explicit hemisphere and legacy modes.
-"""
+"""Batch ERP stylization with north/south charts and an optimized RGB hard-cut."""
 
 import argparse
-import json
-import os
 from pathlib import Path
-from typing import Tuple
 
 import numpy as np
 import torch
 from PIL import Image
 
-from telestyleimage_inference import (
-    ImageStyleInference,
-    RGB_HARD_CUT_SOUTH_YAW_DEGREES,
-    SOUTH_CHART_DISPLAY_ROTATION_DEGREES,
-)
-from telestyle_spherical import (
-    extract_stereographic_hemisphere,
-    rotate_erp_image,
-)
+from telestyleimage_inference import ImageStyleInference
+from telestyle_spherical import extract_stereographic_hemisphere
 
 
 DEFAULT_PROMPT = (
@@ -30,6 +16,9 @@ DEFAULT_PROMPT = (
     "Figure 1. Preserve the panorama geometry and seamless horizontal "
     "wrap-around continuity."
 )
+IMAGE_SUFFIXES = frozenset({
+    ".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp",
+})
 
 
 def _nearest_multiple_of_16(value: int) -> int:
@@ -37,10 +26,28 @@ def _nearest_multiple_of_16(value: int) -> int:
     return max(16, int(round(value / 16.0)) * 16)
 
 
+def _style_paths(style_dir: Path) -> list[Path]:
+    """Return supported style images in deterministic filename order."""
+    if not style_dir.is_dir():
+        raise FileNotFoundError(f"style directory does not exist: {style_dir}")
+    paths = sorted(
+        (
+            path for path in style_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+        ),
+        key=lambda path: path.name.casefold(),
+    )
+    if not paths:
+        raise FileNotFoundError(
+            f"style directory contains no supported images: {style_dir}"
+        )
+    return paths
+
+
 def _restore_outside_equatorial_band(
     repaired: Image.Image, baseline: Image.Image, band_degrees: float,
 ) -> Image.Image:
-    """Copy baseline RGB exactly outside the requested latitude band."""
+    """Keep the original hard cut exactly outside the repaired latitude band."""
     if repaired.size != baseline.size:
         raise ValueError("repaired and baseline images must have identical sizes.")
     if band_degrees == 0:
@@ -48,187 +55,12 @@ def _restore_outside_equatorial_band(
     repaired_array = np.asarray(repaired.convert("RGB"))
     baseline_array = np.asarray(baseline.convert("RGB")).copy()
     height = repaired_array.shape[0]
-    latitude = 90.0 - (np.arange(height, dtype=np.float32) + 0.5) * (180.0 / height)
+    latitude = 90.0 - (np.arange(height, dtype=np.float32) + 0.5) * (
+        180.0 / height
+    )
     inside = np.abs(latitude) < band_degrees
     baseline_array[inside, :, :] = repaired_array[inside, :, :]
     return Image.fromarray(baseline_array, "RGB")
-
-
-def _aligned_margin(width: int, requested_margin: int) -> int:
-    """Clamp a circular extension to half the panorama width and align it."""
-    if requested_margin <= 0:
-        raise ValueError("margin-px must be greater than zero.")
-    max_margin = width // 2
-    margin = min(requested_margin, max_margin)
-    margin -= margin % 16
-    if margin < 16:
-        raise ValueError(
-            "Panorama is too narrow for a 16-pixel circular margin; "
-            "use an image at least 32 pixels wide."
-        )
-    return margin
-
-
-def make_wrapped_canvas(panorama: Image.Image, margin: int) -> Image.Image:
-    """Create ``[right edge | panorama | left edge]`` without blending."""
-    panorama = panorama.convert("RGB")
-    width, height = panorama.size
-    if not 0 < margin <= width // 2:
-        raise ValueError("margin must be positive and no larger than half the width.")
-
-    canvas = Image.new("RGB", (width + 2 * margin, height))
-    canvas.paste(panorama.crop((width - margin, 0, width, height)), (0, 0))
-    canvas.paste(panorama, (margin, 0))
-    canvas.paste(panorama.crop((0, 0, margin, height)), (margin + width, 0))
-    return canvas
-
-
-def resize_for_pipeline(canvas: Image.Image) -> Image.Image:
-    """Resize only the working canvas to DiT-compatible dimensions."""
-    width, height = canvas.size
-    target_size = (_nearest_multiple_of_16(width), _nearest_multiple_of_16(height))
-    if target_size == canvas.size:
-        return canvas
-    return canvas.resize(target_size, Image.Resampling.LANCZOS)
-
-
-def extract_panorama(
-    generated_canvas: Image.Image,
-    source_size: Tuple[int, int],
-    source_margin: int,
-) -> Image.Image:
-    """Extract the centre ERP after latent-space seam synchronization."""
-    source_width, _ = source_size
-    generated_canvas = generated_canvas.convert("RGB")
-    canvas_width, canvas_height = generated_canvas.size
-    source_canvas_width = source_width + 2 * source_margin
-    x0 = round(source_margin * canvas_width / source_canvas_width)
-    x1 = round((source_margin + source_width) * canvas_width / source_canvas_width)
-    x0 = max(1, min(x0, canvas_width - 1))
-    x1 = max(x0 + 1, min(x1, canvas_width - 1))
-    result = generated_canvas.crop((x0, 0, x1, canvas_height))
-    return result.resize(source_size, Image.Resampling.LANCZOS) if result.size != source_size else result
-
-
-def _stylize_panorama_legacy(
-    engine: ImageStyleInference,
-    content: Image.Image,
-    style: Image.Image,
-    prompt: str,
-    seed: int,
-    steps: int,
-    margin_px: int,
-    blend_px: int,
-    enable_polar_fusion: bool = False,
-    polar_rotation_degrees: float = 90.0,
-    polar_blend_start_degrees: float = 45.0,
-    polar_blend_end_degrees: float = 75.0,
-    polar_fusion_steps: int = 2,
-    polar_fusion_strength: float = 1.0,
-    polar_lowpass_radius_latent: int = 8,
-    polar_detail_limiter: bool = True,
-    polar_detail_start_degrees: float = 65.0,
-    polar_detail_end_degrees: float = 88.0,
-    polar_detail_radius_latent: int = 24,
-    polar_detail_steps: int = 2,
-) -> tuple[Image.Image, int, Tuple[int, int]]:
-    """Run one wrapped inference pass and return the seam-blended ERP."""
-    content = content.convert("RGB")
-    source_size = content.size
-    if source_size[0] < 32 or source_size[1] < 16:
-        raise ValueError("Content panorama must be at least 32x16 pixels.")
-    if steps <= 0:
-        raise ValueError("steps must be greater than zero.")
-
-    margin = _aligned_margin(source_size[0], margin_px)
-    if blend_px < 0:
-        raise ValueError("blend-px cannot be negative.")
-    if blend_px > margin:
-        raise ValueError("blend-px cannot be larger than the effective margin.")
-    if enable_polar_fusion:
-        if polar_fusion_steps <= 0:
-            raise ValueError("polar-fusion-steps must be greater than zero.")
-        if not 0.0 <= polar_fusion_strength <= 1.0:
-            raise ValueError("polar-fusion-strength must be between zero and one.")
-        if not 0 <= polar_blend_start_degrees < polar_blend_end_degrees < 90:
-            raise ValueError("polar blend degrees must satisfy 0 <= start < end < 90.")
-        if polar_lowpass_radius_latent < 0:
-            raise ValueError("polar-lowpass-radius-latent cannot be negative.")
-        if polar_detail_radius_latent < 0:
-            raise ValueError("polar-detail-radius-latent cannot be negative.")
-        if polar_detail_steps <= 0:
-            raise ValueError("polar-detail-steps must be greater than zero.")
-        if not 0 <= polar_detail_start_degrees < polar_detail_end_degrees < 90:
-            raise ValueError("polar detail degrees must satisfy 0 <= start < end < 90.")
-
-    wrapped = make_wrapped_canvas(content, margin)
-    working_content = resize_for_pipeline(wrapped)
-    working_content_b = None
-    if enable_polar_fusion:
-        rotated_content = rotate_erp_image(content, polar_rotation_degrees)
-        working_content_b = resize_for_pipeline(make_wrapped_canvas(rotated_content, margin))
-        if working_content_b.size != working_content.size:
-            raise ValueError("Rotated and original working canvases must have identical dimensions.")
-    working_style = style.convert("RGB").resize((1024, 1024), Image.Resampling.LANCZOS)
-    x0 = round(margin * working_content.width / wrapped.width)
-    x1 = round((margin + source_size[0]) * working_content.width / wrapped.width)
-    centre_x_latent = x0 // 8
-    centre_width_latent = x1 // 8 - centre_x_latent
-    blend_width_latent = min(round(blend_px * working_content.width / wrapped.width / 8), centre_x_latent, centre_width_latent // 2)
-    if enable_polar_fusion:
-        generated = engine.inference_with_latent_polar_fusion(
-            prompt, working_content, working_content_b, working_style, seed, steps,
-            centre_x_latent, centre_width_latent, blend_width_latent,
-            polar_rotation_degrees, polar_blend_start_degrees,
-            polar_blend_end_degrees, polar_fusion_steps, polar_fusion_strength,
-            polar_lowpass_radius_latent, polar_detail_limiter,
-            polar_detail_start_degrees, polar_detail_end_degrees,
-            polar_detail_radius_latent, polar_detail_steps,
-        )
-    else:
-        generated = engine.inference_with_latent_seam_sync(
-            prompt, working_content, working_style, seed, steps,
-            centre_x_latent, centre_width_latent, blend_width_latent,
-        )
-    return extract_panorama(generated, source_size, margin), margin, working_content.size
-
-
-def _effective_decode_padding(
-    target_size: Tuple[int, int], requested_padding: int,
-) -> int:
-    """Clamp decode padding to the aligned ERP dimensions."""
-    if requested_padding < 0:
-        raise ValueError("decode-padding-px cannot be negative.")
-    padding = min(requested_padding, min(target_size) // 2)
-    return padding - padding % 16
-
-
-def _validate_panorama_mode(
-    panorama_mode, enable_polar_fusion=False, use_sphere_adapter=False,
-    rgb_hard_cut_without_a1=False, return_chart_images=False,
-):
-    """Reject incompatible panorama features before allocating model state."""
-    if panorama_mode not in ("spherope", "hemisphere", "legacy"):
-        raise ValueError("panorama_mode must be 'spherope', 'hemisphere', or 'legacy'.")
-    if use_sphere_adapter and rgb_hard_cut_without_a1:
-        raise ValueError("A1 and no-A1 RGB hard-cut modes are mutually exclusive.")
-    if panorama_mode != "hemisphere" and (
-        use_sphere_adapter or rgb_hard_cut_without_a1 or return_chart_images
-    ):
-        raise ValueError("A1, RGB hard-cut, and chart image output require --panorama-mode hemisphere.")
-    if enable_polar_fusion and panorama_mode != "legacy":
-        raise ValueError("legacy polar options require --panorama-mode legacy.")
-
-
-def _spherope_working_size(content, steps, decode_padding_px):
-    """Validate a full ERP and return its aligned size and effective padding."""
-    if content.width < 32 or content.height < 16 or content.width != 2 * content.height:
-        raise ValueError("SpheRoPE content must be a 2:1 ERP of at least 32x16 pixels.")
-    if steps <= 0:
-        raise ValueError("steps must be greater than zero.")
-    height = _nearest_multiple_of_16(content.height)
-    size = (2 * height, height)
-    return size, _effective_decode_padding(size, decode_padding_px)
 
 
 def stylize_panorama(
@@ -238,111 +70,43 @@ def stylize_panorama(
     prompt: str,
     seed: int,
     steps: int,
-    margin_px: int,
-    blend_px: int,
-    enable_polar_fusion: bool = False,
-    polar_rotation_degrees: float = 90.0,
-    polar_blend_start_degrees: float = 45.0,
-    polar_blend_end_degrees: float = 75.0,
-    polar_fusion_steps: int = 2,
-    polar_fusion_strength: float = 1.0,
-    polar_lowpass_radius_latent: int = 8,
-    polar_detail_limiter: bool = True,
-    polar_detail_start_degrees: float = 65.0,
-    polar_detail_end_degrees: float = 88.0,
-    polar_detail_radius_latent: int = 24,
-    polar_detail_steps: int = 2,
-    panorama_mode: str = "spherope",
     hemisphere_size: int | None = None,
     hemisphere_overlap_degrees: float = 15.0,
     hemisphere_color_match_degrees: float = 6.0,
     hemisphere_seam_residual_degrees: float = 2.0,
     hemisphere_seam_residual_blur_degrees: float = 0.5,
-    decode_padding_px: int = 128,
-    use_sphere_adapter: bool = False,
-    rgb_hard_cut_without_a1: bool = False,
-    return_chart_images: bool = False,
-):
-    """Stylize a complete ERP using SpheRoPE, hemisphere charts, or legacy wrap."""
-    _validate_panorama_mode(
-        panorama_mode, enable_polar_fusion, use_sphere_adapter,
-        rgb_hard_cut_without_a1, return_chart_images,
-    )
-    if panorama_mode == "spherope":
-        target_size, padding = _spherope_working_size(content, steps, decode_padding_px)
-        working_content = content.convert("RGB").resize(target_size, Image.Resampling.LANCZOS)
-        working_style = style.convert("RGB").resize((1024, 1024), Image.Resampling.LANCZOS)
-        generated = engine.inference_with_spherope(
-            prompt, working_content, working_style, seed, steps, padding_px=padding,
-        )
-        if generated.size != content.size:
-            generated = generated.resize(content.size, Image.Resampling.LANCZOS)
-        return generated, padding, target_size
-    if panorama_mode == "legacy":
-        if return_chart_images or rgb_hard_cut_without_a1:
-            raise ValueError("chart image output requires A1 hemisphere inference.")
-        return _stylize_panorama_legacy(
-            engine, content, style, prompt, seed, steps, margin_px, blend_px,
-            enable_polar_fusion, polar_rotation_degrees,
-            polar_blend_start_degrees, polar_blend_end_degrees,
-            polar_fusion_steps, polar_fusion_strength,
-            polar_lowpass_radius_latent, polar_detail_limiter,
-            polar_detail_start_degrees, polar_detail_end_degrees,
-            polar_detail_radius_latent, polar_detail_steps,
-        )
-
+) -> Image.Image:
+    """Generate one ERP with two charts, an equator hard cut, and seam repair."""
     content = content.convert("RGB")
     source_size = content.size
     if source_size[0] < 32 or source_size[1] < 16:
         raise ValueError("Content panorama must be at least 32x16 pixels.")
+    if source_size[0] != 2 * source_size[1]:
+        raise ValueError("Content panorama must be a 2:1 ERP.")
     if steps <= 0:
         raise ValueError("steps must be greater than zero.")
     if not 0 < hemisphere_overlap_degrees < 45:
-        raise ValueError(
-            "hemisphere-overlap-degrees must be between zero and 45."
-        )
-    if rgb_hard_cut_without_a1 and not (
-        0.0 <= hemisphere_color_match_degrees <= hemisphere_overlap_degrees
-    ):
+        raise ValueError("hemisphere-overlap-degrees must be between zero and 45.")
+    if not 0.0 <= hemisphere_color_match_degrees <= hemisphere_overlap_degrees:
         raise ValueError(
             "hemisphere-color-match-degrees must be between zero and "
             "hemisphere-overlap-degrees."
         )
-    if rgb_hard_cut_without_a1 and not (
-        0.0 <= hemisphere_seam_residual_degrees <= hemisphere_overlap_degrees
-    ):
+    if not 0.0 <= hemisphere_seam_residual_degrees <= hemisphere_overlap_degrees:
         raise ValueError(
             "hemisphere-seam-residual-degrees must be between zero and "
             "hemisphere-overlap-degrees."
         )
-    if (
-        rgb_hard_cut_without_a1
-        and hemisphere_seam_residual_degrees > 0
-        and (
-            not np.isfinite(hemisphere_seam_residual_blur_degrees)
-            or hemisphere_seam_residual_blur_degrees <= 0
-        )
-    ):
-        raise ValueError(
-            "hemisphere-seam-residual-blur-degrees must be finite and positive."
-        )
+
     if hemisphere_size is None:
         chart_size = _nearest_multiple_of_16(source_size[1])
+    elif hemisphere_size <= 0 or hemisphere_size % 16:
+        raise ValueError("hemisphere-size must be positive and divisible by 16.")
     else:
-        if hemisphere_size <= 0 or hemisphere_size % 16:
-            raise ValueError(
-                "hemisphere-size must be positive and divisible by 16."
-            )
         chart_size = hemisphere_size
 
-    target_size = (
-        _nearest_multiple_of_16(source_size[0]),
-        _nearest_multiple_of_16(source_size[1]),
-    )
-    decode_padding = _effective_decode_padding(target_size, decode_padding_px)
-    effective_decode_padding = (
-        0 if use_sphere_adapter or rgb_hard_cut_without_a1 else decode_padding
-    )
+    output_height = _nearest_multiple_of_16(source_size[1])
+    output_width = 2 * output_height
     content_north = extract_stereographic_hemisphere(
         content, chart_size, hemisphere_overlap_degrees, north=True
     )
@@ -352,362 +116,96 @@ def stylize_panorama(
     working_style = style.convert("RGB").resize(
         (1024, 1024), Image.Resampling.LANCZOS
     )
-    if return_chart_images and not use_sphere_adapter:
-        raise ValueError("chart image output requires an enabled A1 adapter.")
-    hard_cut_baseline = None
-    if return_chart_images:
-        generated, north_image, south_image = (
-            engine.inference_with_hemisphere_sphere_adapter(
-                prompt, content_north, content_south, working_style, seed, steps,
-                target_size[1], target_size[0], hemisphere_overlap_degrees,
-                effective_decode_padding // 8, return_chart_images=True,
-            )
-        )
-    elif rgb_hard_cut_without_a1:
-        generated, hard_cut_baseline = (
-            engine.inference_with_hemisphere_rgb_hard_cut(
-                prompt, content_north, content_south, working_style, seed, steps,
-                target_size[1], target_size[0], hemisphere_overlap_degrees,
-                color_match_degrees=hemisphere_color_match_degrees,
-                seam_residual_degrees=hemisphere_seam_residual_degrees,
-                seam_residual_blur_degrees=(
-                    hemisphere_seam_residual_blur_degrees
-                ),
-                return_hard_cut_baseline=True,
-            )
-        )
-    elif use_sphere_adapter:
-        generated = engine.inference_with_hemisphere_sphere_adapter(
-            prompt, content_north, content_south, working_style, seed, steps,
-            target_size[1], target_size[0], hemisphere_overlap_degrees,
-            effective_decode_padding // 8,
-        )
-    else:
-        generated = engine.inference_with_hemisphere_latent_sync(
-            prompt, content_north, content_south, working_style, seed, steps,
-            target_size[1], target_size[0], hemisphere_overlap_degrees,
-            effective_decode_padding // 8,
-        )
+    generated, hard_cut = engine.inference_with_hemisphere_rgb_hard_cut(
+        prompt, content_north, content_south, working_style, seed, steps,
+        output_height, output_width, hemisphere_overlap_degrees,
+        color_match_degrees=hemisphere_color_match_degrees,
+        seam_residual_degrees=hemisphere_seam_residual_degrees,
+        seam_residual_blur_degrees=hemisphere_seam_residual_blur_degrees,
+    )
     if generated.size != source_size:
         generated = generated.resize(source_size, Image.Resampling.LANCZOS)
-        if hard_cut_baseline is not None:
-            hard_cut_baseline = hard_cut_baseline.resize(
-                source_size, Image.Resampling.LANCZOS
-            )
-    if hard_cut_baseline is not None:
-        generated = _restore_outside_equatorial_band(
-            generated, hard_cut_baseline,
-            max(
-                hemisphere_color_match_degrees,
-                hemisphere_seam_residual_degrees,
-            ),
-        )
-    if return_chart_images:
-        return (
-            generated, effective_decode_padding, (chart_size, chart_size),
-            north_image, south_image,
-        )
-    return generated, effective_decode_padding, (chart_size, chart_size)
-
-
-def _a1_ab_output_paths(output_path: Path) -> tuple[Path, Path, Path]:
-    """Derive baseline, no-A1 hard-cut, and report paths."""
-    suffix = output_path.suffix
-    a1_suffix = "_a1_rgb_hardcut"
-    if output_path.stem.endswith(a1_suffix):
-        root = output_path.stem[:-len(a1_suffix)]
-        no_a1_stem = f"{root}_no_a1_rgb_hardcut"
-    else:
-        no_a1_stem = f"{output_path.stem}_no_a1_rgb_hardcut"
-    return (
-        output_path.with_name(f"{output_path.stem}_baseline{suffix}"),
-        output_path.with_name(f"{no_a1_stem}{suffix}"),
-        output_path.with_name(f"{output_path.stem}_report.json"),
+        hard_cut = hard_cut.resize(source_size, Image.Resampling.LANCZOS)
+    return _restore_outside_equatorial_band(
+        generated, hard_cut,
+        max(hemisphere_color_match_degrees, hemisphere_seam_residual_degrees),
     )
-
-
-def _a1_chart_output_paths(output_path: Path) -> tuple[Path, Path]:
-    """Derive native north/south chart image paths from the A1 output."""
-    suffix = output_path.suffix
-    return (
-        output_path.with_name(f"{output_path.stem}_north_chart{suffix}"),
-        output_path.with_name(f"{output_path.stem}_south_chart{suffix}"),
-    )
-
-
-def _rgb_comparison_metrics(
-    first: Image.Image, second: Image.Image,
-    first_label: str = "baseline", second_label: str = "a1",
-) -> dict[str, float]:
-    """Return simple normalized pixel-change and ERP seam diagnostics."""
-    first_array = np.asarray(first.convert("RGB"), dtype=np.float32) / 255.0
-    second_array = np.asarray(second.convert("RGB"), dtype=np.float32) / 255.0
-    if first_array.shape != second_array.shape:
-        raise ValueError("A1 comparison images must have identical sizes.")
-
-    def seam_l1(array: np.ndarray) -> float:
-        return float(np.abs(array[:, 0] - array[:, -1]).mean())
-
-    difference = np.abs(second_array - first_array)
-    return {
-        "pixel_mae": float(difference.mean()),
-        "pixel_max_difference": float(difference.max()),
-        f"{first_label}_left_right_seam_l1": seam_l1(first_array),
-        f"{second_label}_left_right_seam_l1": seam_l1(second_array),
-    }
-
-
-def _validate_a1_args(args: argparse.Namespace) -> None:
-    """Validate optional A1 CLI combinations before loading large models."""
-    if args.a1_ab_test and not args.a1_checkpoint:
-        raise ValueError("--a1-ab-test requires --a1-checkpoint.")
-    if getattr(args, "save_a1_chart_images", False) and not args.a1_checkpoint:
-        raise ValueError(
-            "--save-a1-chart-images requires --a1-checkpoint."
-        )
-    if args.a1_checkpoint and args.panorama_mode != "hemisphere":
-        raise ValueError("A1 inference requires --panorama-mode hemisphere.")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="TeleStyle ERP stylization with spherical RoPE")
-    parser.add_argument("--content", required=True, help="Input equirectangular panorama")
-    parser.add_argument("--style", required=True, help="Style reference image")
-    parser.add_argument("--output", required=True, help="Output panorama path")
+    parser = argparse.ArgumentParser(
+        description="Generate one ERP for every style image in a directory"
+    )
+    parser.add_argument("--content", required=True, help="Input 2:1 ERP panorama")
+    parser.add_argument(
+        "--style-dir", default="inputs/style",
+        help="Directory of style reference images",
+    )
+    parser.add_argument(
+        "--output-dir", default="qwen_style_output",
+        help="Directory for generated ERP images",
+    )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="Editing instruction")
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument(
-        "--panorama-mode", choices=("spherope", "hemisphere", "legacy"),
-        default="spherope", help="Panorama generation method",
-    )
-    parser.add_argument(
         "--hemisphere-size", type=int, default=None,
-        help="Hemisphere-only square chart size; defaults to the aligned ERP height",
+        help="Square chart size; defaults to the aligned ERP height",
     )
     parser.add_argument(
         "--hemisphere-overlap-degrees", type=float, default=15.0,
-        help="Angular overlap across the equator for latent synchronization",
+        help="Chart overlap across the equator",
     )
     parser.add_argument(
         "--hemisphere-color-match-degrees", type=float, default=6.0,
-        help="No-A1 RGB hard-cut low-frequency matching half-width; zero disables it",
+        help="Low-frequency color matching half-width; zero disables it",
     )
     parser.add_argument(
         "--hemisphere-seam-residual-degrees", type=float, default=2.0,
-        help="No-A1 RGB hard-cut equator residual correction half-width",
+        help="Equator residual correction half-width; zero disables it",
     )
     parser.add_argument(
         "--hemisphere-seam-residual-blur-degrees", type=float, default=0.5,
-        help="Longitude smoothing scale for no-A1 equator residual correction",
-    )
-    parser.add_argument(
-        "--decode-padding-px", type=int, default=128,
-        help="Spherical VAE padding: encode/decode in spherope, decode in hemisphere; unused by A1",
-    )
-    parser.add_argument("--margin-px", type=int, default=256, help="Circular extension width")
-    parser.add_argument("--blend-px", type=int, default=96, help="Latent seam synchronization width")
-    parser.add_argument("--enable-polar-fusion", action="store_true", help="Enable rotated dual-branch polar prediction fusion")
-    parser.add_argument("--polar-rotation-degrees", type=float, default=90.0, help="Fixed X-axis ERP rotation for branch B")
-    parser.add_argument("--polar-blend-start-degrees", type=float, default=45.0, help="Latitude where polar fusion begins")
-    parser.add_argument("--polar-blend-end-degrees", type=float, default=75.0, help="Latitude where polar fusion reaches full weight")
-    parser.add_argument("--polar-fusion-steps", type=int, default=2, help="Number of initial denoising steps guided by branch B")
-    parser.add_argument("--polar-fusion-strength", type=float, default=1.0, help="Multiplier for the early B-to-A guidance schedule")
-    parser.add_argument("--polar-lowpass-radius-latent", type=int, default=8, help="Maximum polar circular low-pass radius in latent pixels; zero disables it")
-    parser.add_argument("--polar-detail-limiter", action=argparse.BooleanOptionalAction, default=True, help="Limit oversampled polar detail during final A refinement")
-    parser.add_argument("--polar-detail-start-degrees", type=float, default=65.0, help="Latitude where final A detail limiting begins")
-    parser.add_argument("--polar-detail-end-degrees", type=float, default=88.0, help="Latitude where final A detail limiting reaches full weight")
-    parser.add_argument("--polar-detail-radius-latent", type=int, default=24, help="Maximum final A polar low-pass radius in latent pixels")
-    parser.add_argument("--polar-detail-steps", type=int, default=2, help="Number of final A denoising steps to limit polar detail")
-    parser.add_argument(
-        "--a1-config", default="configs/a1.yaml",
-        help="SphereAdapter config used to construct the A1 inference module",
-    )
-    parser.add_argument(
-        "--a1-checkpoint",
-        help="Optional A1 SphereAdapter checkpoint; hemisphere mode only",
-    )
-    parser.add_argument(
-        "--a1-ab-test", action="store_true",
-        help="Generate five diagnostic images and one JSON report",
-    )
-    parser.add_argument(
-        "--save-a1-chart-images", action="store_true",
-        help="Decode and save north/south A1 latents before ERP composition",
+        help="Longitude smoothing scale for equator residual correction",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    _validate_a1_args(args)
-    _validate_panorama_mode(
-        args.panorama_mode, args.enable_polar_fusion,
-        bool(args.a1_checkpoint), return_chart_images=args.save_a1_chart_images,
-    )
-    for path, label in ((args.content, "content"), (args.style, "style")):
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"{label} image does not exist: {path}")
-
-    with Image.open(args.content) as image:
+    content_path = Path(args.content)
+    if not content_path.is_file():
+        raise FileNotFoundError(f"content image does not exist: {content_path}")
+    style_paths = _style_paths(Path(args.style_dir))
+    with Image.open(content_path) as image:
         content = image.convert("RGB")
-    with Image.open(args.style) as image:
-        style = image.convert("RGB")
 
-    if args.panorama_mode == "spherope":
-        _spherope_working_size(content, args.steps, args.decode_padding_px)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     engine = ImageStyleInference()
-    checkpoint_info = None
-    if args.a1_checkpoint:
-        expected_chart_size = (
-            args.hemisphere_size
-            if args.hemisphere_size is not None
-            else _nearest_multiple_of_16(content.height)
-        )
-        checkpoint_info = engine.load_sphere_adapter(
-            args.a1_config, args.a1_checkpoint, expected_chart_size
-        )
+    for index, style_path in enumerate(style_paths, start=1):
+        with Image.open(style_path) as image:
+            style = image.convert("RGB")
+        with torch.no_grad():
+            result = stylize_panorama(
+                engine=engine, content=content, style=style,
+                prompt=args.prompt, seed=args.seed, steps=args.steps,
+                hemisphere_size=args.hemisphere_size,
+                hemisphere_overlap_degrees=args.hemisphere_overlap_degrees,
+                hemisphere_color_match_degrees=args.hemisphere_color_match_degrees,
+                hemisphere_seam_residual_degrees=(
+                    args.hemisphere_seam_residual_degrees
+                ),
+                hemisphere_seam_residual_blur_degrees=(
+                    args.hemisphere_seam_residual_blur_degrees
+                ),
+            )
+        output_path = output_dir / f"{style_path.stem}_erp.png"
+        result.save(output_path)
         print(
-            "Loaded experimental TeleStyle + A1 combination: "
-            f"step={checkpoint_info['step']}, chart={expected_chart_size}."
+            f"[{index}/{len(style_paths)}] Saved {output_path} | "
+            f"style={style_path.name} | input={content.size}"
         )
-
-    stylize_kwargs = {
-        "engine": engine,
-        "content": content,
-        "style": style,
-        "prompt": args.prompt,
-        "seed": args.seed,
-        "steps": args.steps,
-        "margin_px": args.margin_px,
-        "blend_px": args.blend_px,
-        "enable_polar_fusion": args.enable_polar_fusion,
-        "polar_rotation_degrees": args.polar_rotation_degrees,
-        "polar_blend_start_degrees": args.polar_blend_start_degrees,
-        "polar_blend_end_degrees": args.polar_blend_end_degrees,
-        "polar_fusion_steps": args.polar_fusion_steps,
-        "polar_fusion_strength": args.polar_fusion_strength,
-        "polar_lowpass_radius_latent": args.polar_lowpass_radius_latent,
-        "polar_detail_limiter": args.polar_detail_limiter,
-        "polar_detail_start_degrees": args.polar_detail_start_degrees,
-        "polar_detail_end_degrees": args.polar_detail_end_degrees,
-        "polar_detail_radius_latent": args.polar_detail_radius_latent,
-        "polar_detail_steps": args.polar_detail_steps,
-        "panorama_mode": args.panorama_mode,
-        "hemisphere_size": args.hemisphere_size,
-        "hemisphere_overlap_degrees": args.hemisphere_overlap_degrees,
-        "hemisphere_color_match_degrees": args.hemisphere_color_match_degrees,
-        "hemisphere_seam_residual_degrees": args.hemisphere_seam_residual_degrees,
-        "hemisphere_seam_residual_blur_degrees": (
-            args.hemisphere_seam_residual_blur_degrees
-        ),
-        "decode_padding_px": args.decode_padding_px,
-    }
-
-    baseline = None
-    no_a1_rgb_hard_cut = None
-    save_chart_images = args.save_a1_chart_images or args.a1_ab_test
-    with torch.no_grad():
-        if args.a1_ab_test:
-            baseline, _, _ = stylize_panorama(
-                **stylize_kwargs, use_sphere_adapter=False
-            )
-            no_a1_rgb_hard_cut, _, _ = stylize_panorama(
-                **stylize_kwargs, rgb_hard_cut_without_a1=True
-            )
-        result_payload = stylize_panorama(
-            **stylize_kwargs,
-            use_sphere_adapter=bool(args.a1_checkpoint),
-            return_chart_images=save_chart_images,
-        )
-        if save_chart_images:
-            result, margin, working_size, north_image, south_image = result_payload
-        else:
-            result, margin, working_size = result_payload
-            north_image = None
-            south_image = None
-
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    result.save(output_path)
-    extra_outputs = []
-    chart_paths = None
-    if north_image is not None and south_image is not None:
-        chart_paths = _a1_chart_output_paths(output_path)
-        north_image.save(chart_paths[0])
-        south_image.save(chart_paths[1])
-        extra_outputs.extend(chart_paths)
-    if baseline is not None and no_a1_rgb_hard_cut is not None:
-        baseline_path, no_a1_path, report_path = _a1_ab_output_paths(
-            output_path
-        )
-        baseline.save(baseline_path)
-        no_a1_rgb_hard_cut.save(no_a1_path)
-        report = {
-            "experimental_combination": True,
-            "content": str(Path(args.content).resolve()),
-            "style": str(Path(args.style).resolve()),
-            "prompt": args.prompt,
-            "seed": args.seed,
-            "steps": args.steps,
-            "hemisphere_size": working_size[0],
-            "hemisphere_overlap_degrees": args.hemisphere_overlap_degrees,
-            "hemisphere_color_match_degrees": args.hemisphere_color_match_degrees,
-            "hemisphere_seam_residual_degrees": args.hemisphere_seam_residual_degrees,
-            "hemisphere_seam_residual_blur_degrees": (
-                args.hemisphere_seam_residual_blur_degrees
-            ),
-            "a1_composition": "decoded_rgb_hard_cut",
-            "no_a1_composition": "independent_decoded_rgb_hard_cut_with_color_and_residual_match",
-            "rgb_hard_cut_antialias_scale": 2,
-            "south_rgb_yaw_degrees": RGB_HARD_CUT_SOUTH_YAW_DEGREES,
-            "south_chart_display_rotation_degrees": (
-                SOUTH_CHART_DISPLAY_ROTATION_DEGREES
-            ),
-            "a1_config": str(Path(args.a1_config).resolve()),
-            "a1_checkpoint": checkpoint_info,
-            "outputs": {
-                "baseline": str(baseline_path.resolve()),
-                "no_a1_rgb_hard_cut": str(no_a1_path.resolve()),
-                "a1_rgb_hard_cut": str(output_path.resolve()),
-                "north_chart": str(chart_paths[0].resolve()),
-                "south_chart": str(chart_paths[1].resolve()),
-            },
-            "metrics": {
-                "baseline_vs_a1": _rgb_comparison_metrics(
-                    baseline, result
-                ),
-                "no_a1_rgb_hard_cut_vs_a1": _rgb_comparison_metrics(
-                    no_a1_rgb_hard_cut, result,
-                    first_label="no_a1_rgb_hard_cut",
-                    second_label="a1",
-                ),
-            },
-        }
-        report_path.write_text(
-            json.dumps(report, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        extra_outputs.extend([baseline_path, no_a1_path, report_path])
-
-    if args.panorama_mode == "spherope":
-        mode_details = f"erp={working_size} | encode_decode_padding={margin}px"
-    elif args.panorama_mode == "hemisphere":
-        mode_details = (
-            f"chart={working_size} | overlap={args.hemisphere_overlap_degrees}deg | "
-            f"decode_padding={margin}px | a1={bool(args.a1_checkpoint)}"
-        )
-    else:
-        mode_details = (
-            f"model_canvas={working_size} | margin={margin}px | "
-            f"blend={args.blend_px}px | polar_fusion={args.enable_polar_fusion}"
-        )
-    print(
-        f"Saved {output_path} | input={content.size} | "
-        f"mode={args.panorama_mode} | {mode_details}"
-    )
-    if extra_outputs:
-        print("Saved extra artifacts: " + ", ".join(map(str, extra_outputs)))
 
 
 if __name__ == "__main__":
